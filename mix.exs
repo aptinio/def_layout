@@ -23,7 +23,10 @@ defmodule DefLayout.MixProject do
   end
 
   defp deps do
-    []
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:quokka, "~> 2.12", only: [:dev, :test], runtime: false}
+    ]
   end
 
   defp aliases do
@@ -33,6 +36,7 @@ defmodule DefLayout.MixProject do
         "hex.audit",
         "format",
         "compile --warnings-as-errors",
+        "credo --format oneline",
         "test"
       ]
     ]

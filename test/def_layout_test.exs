@@ -1,5 +1,6 @@
 defmodule DefLayoutTest do
-  use ExUnit.Case
+  use ExUnit.Case, async: true
+
   doctest DefLayout
 
   test "greets the world" do
