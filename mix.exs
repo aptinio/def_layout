@@ -29,6 +29,7 @@ defmodule DefLayout.MixProject do
   defp aliases do
     [
       precommit: [
+        "format",
         "compile --warnings-as-errors",
         "test"
       ]
