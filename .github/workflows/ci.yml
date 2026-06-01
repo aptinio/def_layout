@@ -70,4 +70,4 @@ jobs:
       - run: mix credo --format oneline
         if: ${{ matrix.lint }}
 
-      - run: mix test
+      - run: mix test --cover
