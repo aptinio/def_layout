@@ -29,6 +29,8 @@ defmodule DefLayout.MixProject do
   defp aliases do
     [
       precommit: [
+        "deps.unlock --unused",
+        "hex.audit",
         "format",
         "compile --warnings-as-errors",
         "test"
