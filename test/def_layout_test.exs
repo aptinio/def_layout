@@ -743,6 +743,106 @@ defmodule DefLayoutTest do
   end
 
   describe "module header" do
+    test "a @behaviour declaration in the header still reorders" do
+      source = """
+      defmodule M do
+        @behaviour GenServer
+
+        def beta do
+          :beta
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @behaviour GenServer
+
+        def alpha do
+          :alpha
+        end
+
+        def beta do
+          :beta
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "module-level type and callback attributes in the header still reorder" do
+      source = """
+      defmodule M do
+        @type t :: :alpha | :beta
+        @callback init(t) :: t
+
+        def beta do
+          :beta
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @type t :: :alpha | :beta
+        @callback init(t) :: t
+
+        def alpha do
+          :alpha
+        end
+
+        def beta do
+          :beta
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a defstruct in the header still reorders" do
+      source = """
+      defmodule M do
+        @enforce_keys [:name]
+        defstruct [:name, :age]
+
+        def beta(s) do
+          s
+        end
+
+        def alpha(s) do
+          s
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @enforce_keys [:name]
+        defstruct [:name, :age]
+
+        def alpha(s) do
+          s
+        end
+
+        def beta(s) do
+          s
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
     test "a header of recognized module-level constructs still reorders" do
       source = """
       defmodule M do
@@ -795,6 +895,134 @@ defmodule DefLayoutTest do
       assert format(source) == source
     end
 
+    test "module-level compile hooks in the header still reorder" do
+      source = """
+      defmodule M do
+        @compile {:inline, alpha: 0}
+        @before_compile Hooks
+        @after_compile Hooks
+        @after_verify Hooks
+        @on_load :setup
+        @vsn "1.0.0"
+        @external_resource "priv/data"
+
+        def beta do
+          :beta
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @compile {:inline, alpha: 0}
+        @before_compile Hooks
+        @after_compile Hooks
+        @after_verify Hooks
+        @on_load :setup
+        @vsn "1.0.0"
+        @external_resource "priv/data"
+
+        def alpha do
+          :alpha
+        end
+
+        def beta do
+          :beta
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "the remaining recognized header attributes still reorder" do
+      # Every name is load-bearing: if any weren't recognized, the header would
+      # fail `header_safe?` and the module would bail instead of reordering.
+      source = """
+      defmodule M do
+        @behavior GenServer
+        @typep tp :: :x
+        @opaque op :: :y
+        @macrocallback mc(integer) :: Macro.t()
+        @optional_callbacks mc: 1
+        @derive Jason.Encoder
+        defexception [:message]
+
+        def beta, do: :beta
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @behavior GenServer
+        @typep tp :: :x
+        @opaque op :: :y
+        @macrocallback mc(integer) :: Macro.t()
+        @optional_callbacks mc: 1
+        @derive Jason.Encoder
+        defexception [:message]
+
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a realistic mixed header reorders and is a fixed point" do
+      source = """
+      defmodule M do
+        @moduledoc "M"
+        use GenServer
+        @behaviour GenServer
+
+        @enforce_keys [:name]
+        defstruct [:name]
+
+        @type t :: %__MODULE__{name: String.t()}
+
+        def beta(%__MODULE__{} = s) do
+          s
+        end
+
+        def alpha(%__MODULE__{} = s) do
+          s
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @moduledoc "M"
+        use GenServer
+        @behaviour GenServer
+
+        @enforce_keys [:name]
+        defstruct [:name]
+
+        @type t :: %__MODULE__{name: String.t()}
+
+        def alpha(%__MODULE__{} = s) do
+          s
+        end
+
+        def beta(%__MODULE__{} = s) do
+          s
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
     test "a nested module in the body bails (outer left untouched)" do
       # A nested `defmodule` is an unrecognized construct sitting among the defs,
       # so the outer module bails. The inner module isn't a top-level expr, so it
@@ -818,11 +1046,31 @@ defmodule DefLayoutTest do
     test "an unrecognized macro in the header bails" do
       source = """
       defmodule M do
-        defstruct([:name])
+        plug(:authenticate)
 
         def beta do
           :beta
         end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a recognized attribute interleaved after the first def still bails" do
+      # `@type` is header-safe, but only as a *header* statement. Once it sits
+      # between defs it can't ride a moving function, so the module must bail.
+      source = """
+      defmodule M do
+        def beta do
+          :beta
+        end
+
+        @type t :: :x
 
         def alpha do
           :alpha

@@ -7,8 +7,16 @@ defmodule DefLayout.Scan do
 
   # Module-level constructs allowed to sit in the header above the functions.
   # Anything else in the header -> bail (see `header_safe?/1`).
-  @header_attrs [:moduledoc]
+  @header_attrs [:moduledoc] ++
+                  [:behaviour, :behavior] ++
+                  [:type, :typep, :opaque, :callback, :macrocallback, :optional_callbacks] ++
+                  [:derive, :enforce_keys] ++
+                  [:compile, :before_compile, :after_compile, :after_verify, :on_load] ++
+                  [:vsn, :external_resource]
   @header_directives [:use, :import, :alias, :require]
+  # Recognized by name, like `def`/`import`: we assume standard Kernel semantics.
+  # Shadowing these into def-attaching macros is out of scope (would strand silently).
+  @header_macros [:defstruct, :defexception]
 
   @type def_group :: %{
           key: {atom, non_neg_integer},
@@ -89,6 +97,7 @@ defmodule DefLayout.Scan do
 
   defp allowed_header_expr?({:@, _, [{name, _, _}]}), do: name in @header_attrs
   defp allowed_header_expr?({directive, _, _}) when directive in @header_directives, do: true
+  defp allowed_header_expr?({macro, _, _}) when macro in @header_macros, do: true
   defp allowed_header_expr?(_), do: false
 
   # In scope (for now): only purely public defs not marked `@impl`.
