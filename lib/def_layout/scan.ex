@@ -20,6 +20,8 @@ defmodule DefLayout.Scan do
 
   @type def_group :: %{
           key: {atom, non_neg_integer},
+          kind: :def | :defp,
+          calls: [{atom, non_neg_integer}],
           start: pos_integer,
           stop: pos_integer,
           lines: [String.t()]
@@ -100,9 +102,10 @@ defmodule DefLayout.Scan do
   defp allowed_header_expr?({macro, _, _}) when macro in @header_macros, do: true
   defp allowed_header_expr?(_), do: false
 
-  # In scope (for now): only purely public defs not marked `@impl`.
+  # In scope (for now): public and private defs not marked `@impl`
+  # (callbacks remain a scaffolding bail until Slice 2).
   defp in_scope?(groups) do
-    Enum.all?(groups, fn {_key, exprs} -> def_kind_of(exprs) == :def and not impl_group?(exprs) end)
+    Enum.all?(groups, fn {_key, exprs} -> not impl_group?(exprs) end)
   end
 
   # Slices each group into a verbatim list of source lines, extending upward to
@@ -127,6 +130,8 @@ defmodule DefLayout.Scan do
 
         def_group = %{
           key: key,
+          kind: def_kind_of(exprs),
+          calls: calls_in(exprs),
           start: group_start,
           stop: group_stop,
           lines: lines
@@ -159,6 +164,46 @@ defmodule DefLayout.Scan do
   end
 
   defp impl_group?(exprs), do: Enum.any?(exprs, &match?({:@, _, [{:impl, _, _}]}, &1))
+
+  # The `{name, arity}` local calls in a group's clause bodies, in first-call-site
+  # order (dedup keeps the earliest). Heads/guards are skipped (we walk only the
+  # args after the head), so a group never lists itself, and `@doc`/`@spec`/macros
+  # contribute nothing. Drives caller-anchoring in `DefLayout.Engine`.
+  defp calls_in(exprs) do
+    exprs
+    |> Enum.filter(&def_expr?/1)
+    |> Enum.flat_map(fn {_kind, _, [_head | body]} -> collect_calls(body) end)
+    |> Enum.uniq()
+  end
+
+  defp collect_calls(ast) do
+    {_node, calls} =
+      ast
+      |> Macro.prewalk(&unpipe/1)
+      |> Macro.prewalk([], fn
+        # A local function capture `&name/arity` references it without calling it.
+        {:&, _, [{:/, _, [{name, _, ctx}, arity]}]} = node, acc
+        when is_atom(name) and is_atom(ctx) and is_integer(arity) ->
+          {node, [{name, arity} | acc]}
+
+        {name, _, args} = node, acc when is_atom(name) and is_list(args) ->
+          {node, [{name, length(args)} | acc]}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    Enum.reverse(calls)
+  end
+
+  # `lhs |> f(a)` calls `f/2`, not `f/1`: the piped value is f's first argument.
+  # Rewrite each local pipe into the plain call so the collector sees the real
+  # arity. Remote targets (name is a `.`-tuple, not an atom) are left untouched.
+  defp unpipe({:|>, _, [lhs, {name, meta, args}]}) when is_atom(name) and (is_list(args) or is_nil(args)) do
+    {name, meta, [lhs | List.wrap(args)]}
+  end
+
+  defp unpipe(node), do: node
 
   defp def_group_part?({kind, _, _}) when kind in @def_kinds, do: true
   defp def_group_part?({:@, _, [{name, _, _}]}) when name in @attaching_attrs, do: true
