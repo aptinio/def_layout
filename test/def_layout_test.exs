@@ -593,15 +593,26 @@ defmodule DefLayoutTest do
     end
   end
 
-  # Out-of-scope constructs (callbacks, interleaved statements) leave the module
-  # in source order, still canonically formatted.
-  describe "silent bail (out of strict scope)" do
-    test "a callback leaves public order untouched" do
+  describe "callbacks first" do
+    test "a callback sorts above a public whose name sorts earlier" do
       source = """
       defmodule M do
+        def alpha do
+          :alpha
+        end
+
         @impl true
-        def beta do
-          :beta
+        def zzz do
+          :zzz
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @impl true
+        def zzz do
+          :zzz
         end
 
         def alpha do
@@ -610,9 +621,196 @@ defmodule DefLayoutTest do
       end
       """
 
+      assert format(source) == expected
+    end
+
+    test "two callbacks keep their source order, not alphabetical" do
+      source = """
+      defmodule M do
+        @impl true
+        def zzz do
+          :zzz
+        end
+
+        @impl true
+        def aaa do
+          :aaa
+        end
+      end
+      """
+
       assert format(source) == source
     end
 
+    test "callbacks first, then alphabetical publics, then privates" do
+      source = """
+      defmodule M do
+        def zebra do
+          :zebra
+        end
+
+        defp helper do
+          :helper
+        end
+
+        @impl true
+        def terminate(_reason, _state) do
+          helper()
+        end
+
+        def alpha do
+          :alpha
+        end
+
+        @impl true
+        def init(arg) do
+          {:ok, arg}
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @impl true
+        def terminate(_reason, _state) do
+          helper()
+        end
+
+        defp helper do
+          :helper
+        end
+
+        @impl true
+        def init(arg) do
+          {:ok, arg}
+        end
+
+        def alpha do
+          :alpha
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a private called only by a callback anchors below it" do
+      source = """
+      defmodule M do
+        defp via_callback do
+          :ok
+        end
+
+        def alpha do
+          :alpha
+        end
+
+        @impl true
+        def handle_info(_msg, state) do
+          via_callback()
+          {:noreply, state}
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @impl true
+        def handle_info(_msg, state) do
+          via_callback()
+          {:noreply, state}
+        end
+
+        defp via_callback do
+          :ok
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "@impl false is a normal public, not hoisted as a callback" do
+      # `@impl false` is an explicit *non*-callback marker (Elixir errors if it
+      # actually matches a callback), so it must stay in the alphabetical public
+      # section - never the callbacks-first prefix.
+      source = """
+      defmodule M do
+        @impl false
+        def zzz do
+          :zzz
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          :alpha
+        end
+
+        @impl false
+        def zzz do
+          :zzz
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a moving callback carries its leading comment, @impl, and @spec" do
+      source = """
+      defmodule M do
+        def alpha do
+          :alpha
+        end
+
+        # mounts the thing
+        @impl true
+        @spec mount(map) :: {:ok, map}
+        def mount(socket) do
+          {:ok, socket}
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        # mounts the thing
+        @impl true
+        @spec mount(map) :: {:ok, map}
+        def mount(socket) do
+          {:ok, socket}
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+  end
+
+  # Out-of-scope constructs (interleaved statements) leave the module in source
+  # order - still run through the base formatter, just not reordered.
+  describe "silent bail (interleaved attribute)" do
     test "a statement interleaved among functions leaves order untouched" do
       source = """
       defmodule M do

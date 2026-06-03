@@ -21,6 +21,7 @@ defmodule DefLayout.Scan do
   @type def_group :: %{
           key: {atom, non_neg_integer},
           kind: :def | :defp,
+          callback?: boolean,
           calls: [{atom, non_neg_integer}],
           start: pos_integer,
           stop: pos_integer,
@@ -30,13 +31,12 @@ defmodule DefLayout.Scan do
   # Slices a module body into ordered def_groups carrying their verbatim
   # source-line span. Returns :error (the caller bails, leaving the module
   # untouched) for anything it can't safely move: a non-function expression
-  # interleaved among the functions, a private, an `@impl` def, non-adjacent
-  # duplicate-key clauses, or a header with an unrecognized module-level construct.
+  # interleaved among the functions, non-adjacent duplicate-key clauses, or a
+  # header with an unrecognized module-level construct.
   @spec def_groups([Macro.t()], pos_integer, [String.t()]) :: {:ok, [def_group]} | :error
   def def_groups(exprs, do_line, source_lines) do
     with {:ok, header, groups} <- partition(exprs),
-         true <- header_safe?(header),
-         true <- in_scope?(groups) do
+         true <- header_safe?(header) do
       header_stop = Enum.max([do_line | Enum.map(header, &max_line/1)])
       {:ok, materialize(header_stop, groups, source_lines)}
     else
@@ -102,12 +102,6 @@ defmodule DefLayout.Scan do
   defp allowed_header_expr?({macro, _, _}) when macro in @header_macros, do: true
   defp allowed_header_expr?(_), do: false
 
-  # In scope (for now): public and private defs not marked `@impl`
-  # (callbacks remain a scaffolding bail until Slice 2).
-  defp in_scope?(groups) do
-    Enum.all?(groups, fn {_key, exprs} -> not impl_group?(exprs) end)
-  end
-
   # Slices each group into a verbatim list of source lines, extending upward to
   # capture leading comments. The gap above a group (between it and the previous
   # group, or the header) belongs to it from its first comment line down, so
@@ -131,6 +125,7 @@ defmodule DefLayout.Scan do
         def_group = %{
           key: key,
           kind: def_kind_of(exprs),
+          callback?: callback_group?(exprs),
           calls: calls_in(exprs),
           start: group_start,
           stop: group_stop,
@@ -163,7 +158,14 @@ defmodule DefLayout.Scan do
     |> elem(0)
   end
 
-  defp impl_group?(exprs), do: Enum.any?(exprs, &match?({:@, _, [{:impl, _, _}]}, &1))
+  # A group is a callback when it carries an `@impl` marker - except `@impl false`,
+  # which is Elixir's explicit *non*-callback marker (it errors if the function
+  # actually matches a callback), so such a def stays an ordinary public.
+  defp callback_group?(exprs), do: Enum.any?(exprs, &callback_impl?/1)
+
+  defp callback_impl?({:@, _, [{:impl, _, [false]}]}), do: false
+  defp callback_impl?({:@, _, [{:impl, _, [_value]}]}), do: true
+  defp callback_impl?(_), do: false
 
   # The `{name, arity}` local calls in a group's clause bodies, in first-call-site
   # order (dedup keeps the earliest). Heads/guards are skipped (we walk only the

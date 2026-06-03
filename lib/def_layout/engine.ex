@@ -1,10 +1,13 @@
 defmodule DefLayout.Engine do
   @moduledoc false
 
-  # Publics are roots, alphabetical by `{name, arity}`. Each private sinks just
-  # below its bottom-most caller (the caller that lands lowest in the final
-  # layout), recursively: a private called only by another private rides below
-  # that private. Co-anchored privates (several under one caller) follow the
+  # Roots are the public defs: callbacks (`@impl`) first in source order - their
+  # lifecycle order (init/mount/terminate) is meaningful, so it's preserved, not
+  # alphabetized - then the remaining publics alphabetical by `{name, arity}`.
+  # Each private sinks just below its bottom-most caller (the caller that lands
+  # lowest in the final layout), recursively: a private called only by another
+  # private rides below that private. A private called by a callback anchors below
+  # that callback. Co-anchored privates (several under one caller) follow the
   # caller's first-call-site order.
   #
   # Privates are placed in topological waves - a private is ready once every one
@@ -16,8 +19,9 @@ defmodule DefLayout.Engine do
   @spec order([DefLayout.Scan.def_group()]) :: [DefLayout.Scan.def_group()]
   def order(def_groups) do
     by_key = Map.new(def_groups, &{&1.key, &1})
-    roots = for g <- def_groups, g.kind == :def, do: g.key
-    roots = Enum.sort_by(roots, &sort_key(by_key, &1))
+    callbacks = for g <- def_groups, g.kind == :def, g.callback?, do: g.key
+    publics = for g <- def_groups, g.kind == :def, not g.callback?, do: g.key
+    roots = callbacks ++ Enum.sort_by(publics, &sort_key(by_key, &1))
     privates = for g <- def_groups, g.kind == :defp, do: g.key
 
     {children, placed} = anchor(privates, by_key, roots, %{}, MapSet.new(roots))
