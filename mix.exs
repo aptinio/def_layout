@@ -1,6 +1,16 @@
 defmodule DefLayout.MixProject do
   use Mix.Project
 
+  def application do
+    [
+      extra_applications: [:logger]
+    ]
+  end
+
+  def cli do
+    [preferred_envs: [precommit: :test]]
+  end
+
   def project do
     [
       app: :def_layout,
@@ -10,16 +20,6 @@ defmodule DefLayout.MixProject do
       deps: deps(),
       aliases: aliases(),
       test_coverage: [summary: [threshold: 100]]
-    ]
-  end
-
-  def cli do
-    [preferred_envs: [precommit: :test]]
-  end
-
-  def application do
-    [
-      extra_applications: [:logger]
     ]
   end
 
