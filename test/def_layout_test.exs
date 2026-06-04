@@ -810,6 +810,266 @@ defmodule DefLayoutTest do
 
   # Out-of-scope constructs (interleaved statements) leave the module in source
   # order - still run through the base formatter, just not reordered.
+  describe "pinned macros and guards" do
+    test "a macro above the first def stays pinned while publics sort below it" do
+      source = """
+      defmodule M do
+        defmacro mac(x), do: x
+
+        def beta, do: mac(1)
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro mac(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: mac(1)
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a pinned module is a fixed point" do
+      source = """
+      defmodule M do
+        defmacro mac(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: mac(1)
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a guard used in a def head stays pinned" do
+      source = """
+      defmodule M do
+        defguard is_small(x) when x < 10
+
+        def beta(x) when is_small(x), do: x
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defguard is_small(x) when x < 10
+
+        def alpha, do: :a
+
+        def beta(x) when is_small(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "private macros pin like public ones" do
+      source = """
+      defmodule M do
+        defmacrop double(x), do: quote(do: 2 * unquote(x))
+
+        def beta, do: double(2)
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacrop double(x), do: quote(do: 2 * unquote(x))
+
+        def alpha, do: :a
+
+        def beta, do: double(2)
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "attachments stay with the pin and ride with the moving def" do
+      source = """
+      defmodule M do
+        @doc "expands to its argument"
+        defmacro mac(x), do: x
+
+        @doc "calls the macro"
+        def beta, do: mac(1)
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @doc "expands to its argument"
+        defmacro mac(x), do: x
+
+        def alpha, do: :a
+
+        @doc "calls the macro"
+        def beta, do: mac(1)
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a multi-clause macro pins as one group" do
+      source = """
+      defmodule M do
+        defmacro mac(0), do: 0
+        defmacro mac(x), do: x
+
+        def beta, do: mac(1)
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro mac(0), do: 0
+        defmacro mac(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: mac(1)
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "several pins keep their source order" do
+      source = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        defguard is_small(x) when x < 10
+
+        def beta(x) when is_small(x), do: zeta(x)
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        defguard is_small(x) when x < 10
+
+        def alpha, do: :a
+
+        def beta(x) when is_small(x), do: zeta(x)
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a macro-only module stays untouched" do
+      source = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        defmacro alpha(x), do: quote(do: unquote(zeta(x)))
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a used macro below the first def bails" do
+      # Repositioning it (or permuting defs around it) safely would require
+      # edge-accurate movement - a scanner miss would be a compile error, not a
+      # cosmetic miss - so the module keeps source order.
+      source = """
+      defmodule M do
+        def beta, do: :b
+
+        defmacro mac(x), do: x
+
+        def alpha, do: mac(:a)
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a def sharing the last pin's line is split and laid out" do
+      source = """
+      defmodule M do
+        defmacro mac(x), do: x; def beta, do: mac(:b)
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro mac(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: mac(:b)
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a private called only from a pin's quote tails as an orphan" do
+      # Pins never anchor privates: a private lifted into the pinned tier could
+      # land above a later pin it uses (define-before-use break), so a private
+      # whose only reference sits in a pinned macro's quote falls back to the
+      # source-order tail instead.
+      source = """
+      defmodule M do
+        defmacro mac do
+          quote do
+            helper()
+          end
+        end
+
+        def beta, do: mac()
+
+        def alpha, do: :a
+
+        defp helper, do: :h
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro mac do
+          quote do
+            helper()
+          end
+        end
+
+        def alpha, do: :a
+
+        def beta, do: mac()
+
+        defp helper, do: :h
+      end
+      """
+
+      assert format(source) == expected
+    end
+  end
+
   describe "silent bail (interleaved attribute)" do
     test "a statement interleaved among functions leaves order untouched" do
       source = """
@@ -828,11 +1088,17 @@ defmodule DefLayoutTest do
 
       assert format(source) == source
     end
+  end
 
-    test "a defmacro interleaved among defs leaves order untouched" do
-      # `defmacro` isn't in the reorderable def-family, so once it sits between
-      # functions it's an interleaved non-def statement: the module bails rather
-      # than permute defs around a macro whose define-before-use position matters.
+  # A public macro/guard the module provably never uses is position-free, so
+  # it's just a public: it sorts by `{name, arity}`. Inert is decided by a
+  # conservative whole-module scan - its name occurs nowhere outside its own
+  # group, and its own group references no in-module compile-time name. Every
+  # doubt (quote contents, variables sharing the name, atom literals) resolves
+  # to "used" -> pinned, so the failure direction is over-pinning, never a
+  # define-before-use break.
+  describe "inert macro sorting" do
+    test "an inert macro between defs sorts with the publics" do
       source = """
       defmodule M do
         def beta, do: :b
@@ -843,7 +1109,705 @@ defmodule DefLayoutTest do
       end
       """
 
+      expected = """
+      defmodule M do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmacro mac(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "an inert macro above the first def sorts down" do
+      source = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmacro zeta(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a _web.ex-style module lays out: __using__ sorts first, helpers anchor" do
+      source = """
+      defmodule M do
+        def controller do
+          quote do
+            unquote(html_helpers())
+          end
+        end
+
+        defmacro __using__(which) when is_atom(which) do
+          apply(__MODULE__, which, [])
+        end
+
+        defp html_helpers do
+          quote do
+            :helpers
+          end
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro __using__(which) when is_atom(which) do
+          apply(__MODULE__, which, [])
+        end
+
+        def controller do
+          quote do
+            unquote(html_helpers())
+          end
+        end
+
+        defp html_helpers do
+          quote do
+            :helpers
+          end
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a multi-clause inert macro sorts as one group with its attachments" do
+      source = """
+      defmodule M do
+        @doc "expands to its argument"
+        defmacro zeta(0), do: 0
+        defmacro zeta(x), do: x
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha, do: :a
+
+        @doc "expands to its argument"
+        defmacro zeta(0), do: 0
+        defmacro zeta(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "an inert macro anchors a private referenced in its quote" do
+      # Unlike pins, a sorted macro is a regular root: nothing in the module
+      # references it, so a private under it can never be lifted above a
+      # compile-time definition it needs.
+      source = """
+      defmodule M do
+        defmacro zeta do
+          quote do
+            unquote(helper())
+          end
+        end
+
+        def alpha, do: :a
+
+        defp helper, do: :h
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha, do: :a
+
+        defmacro zeta do
+          quote do
+            unquote(helper())
+          end
+        end
+
+        defp helper, do: :h
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "an @impl macro joins the callbacks tier" do
+      source = """
+      defmodule M do
+        def beta, do: :b
+
+        @impl true
+        defmacro zeta(x), do: x
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @impl true
+        defmacro zeta(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "pins compact upward past a departing inert macro" do
+      # The pin only ever jumps over inert macros sorting away below it -
+      # nothing it depends on, so define-before-use holds.
+      source = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        defguard is_small(x) when x < 10
+
+        def beta(x) when is_small(x), do: x
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defguard is_small(x) when x < 10
+
+        def alpha, do: :a
+
+        def beta(x) when is_small(x), do: x
+
+        defmacro zeta(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a variable sharing the macro's name pins it" do
+      # The scan can't cheaply tell a variable from a bare reference, so the
+      # name occurring at all counts as use.
+      source = """
+      defmodule M do
+        defmacro zeta, do: :z
+
+        def beta do
+          zeta = 1
+          zeta + 1
+        end
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro zeta, do: :z
+
+        def alpha, do: :a
+
+        def beta do
+          zeta = 1
+          zeta + 1
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a reference inside a quote pins the macro" do
+      source = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        def beta do
+          quote do
+            zeta(1)
+          end
+        end
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        def alpha, do: :a
+
+        def beta do
+          quote do
+            zeta(1)
+          end
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "an atom literal sharing the macro's name pins it" do
+      source = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        def beta, do: Keyword.get([], :zeta)
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro zeta(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: Keyword.get([], :zeta)
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a use of the module itself never pins __using__" do
+      # `use M` expands `__using__` without the name appearing - but a
+      # non-quoted in-module use/import/require of self is a compile error
+      # ("currently being defined"), and a quoted one expands in another
+      # module where this one is already loaded, so `__using__`'s position is
+      # never load-bearing in compilable code. No self-use rule needed; the
+      # callback discriminates (pinned would keep `__using__` above it).
+      source = """
+      defmodule M do
+        defmacro __using__(_opts) do
+          quote do
+            :ok
+          end
+        end
+
+        @impl true
+        def init(_state), do: :ok
+
+        def beta do
+          quote do
+            use unquote(__MODULE__)
+          end
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @impl true
+        def init(_state), do: :ok
+
+        defmacro __using__(_opts) do
+          quote do
+            :ok
+          end
+        end
+
+        def beta do
+          quote do
+            use unquote(__MODULE__)
+          end
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a self-referencing after_compile hook's function sorts freely" do
+      # `@after_compile __MODULE__` invokes the `__after_compile__/2` function
+      # after compilation, so its position is free and it sorts like any
+      # public. (No macro equivalent exists: `@before_compile __MODULE__` and
+      # `@on_definition __MODULE__` are compile errors - a module can't invoke
+      # itself mid-compile, the same reason no `use`-self rule is needed.)
+      source = """
+      defmodule M do
+        @after_compile __MODULE__
+
+        def beta, do: :b
+
+        def __after_compile__(_env, _bytecode), do: :ok
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @after_compile __MODULE__
+
+        def __after_compile__(_env, _bytecode), do: :ok
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "an expanded macro suppresses sorting: its expansion could hide a macro call" do
+      # `gen` expands during this module's compile (beta invokes it outside any
+      # quote), and an expansion runs arbitrary code - here it synthesizes a
+      # call to `mac` whose name never appears in source. No syntactic scan
+      # can see that, so when any pinned defmacro is referenced in an
+      # expansion-time position, no macro sorts: `mac` stays pinned above the
+      # defs instead of sorting below `beta` and breaking the build.
+      source = """
+      defmodule M do
+        defmacro mac(x), do: x
+
+        defmacro gen do
+          name = String.to_atom("mac")
+          call = {name, [], [1]}
+
+          quote do
+            unquote(call)
+          end
+        end
+
+        def beta, do: gen()
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro mac(x), do: x
+
+        defmacro gen do
+          name = String.to_atom("mac")
+          call = {name, [], [1]}
+
+          quote do
+            unquote(call)
+          end
+        end
+
+        def alpha, do: :a
+
+        def beta, do: gen()
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "an expanded macro calling a private at expansion time bails the module" do
+      # `unquote(helper())` runs `helper` while `beta` compiles, so `helper`
+      # must stay above `beta` - but it isn't a pin (privates sink), and
+      # orphan-tailing it lands it below the expansion site (build break,
+      # verified). The engine can't honor that constraint, so bail.
+      source = """
+      defmodule M do
+        defmacro mac do
+          quote do
+            unquote(helper())
+          end
+        end
+
+        defp helper, do: :ok
+
+        def beta, do: mac()
+
+        def alpha, do: :a
+      end
+      """
+
       assert format(source) == source
+    end
+
+    test "an expanded macro calling a public at expansion time bails the module" do
+      source = """
+      defmodule M do
+        defmacro mac do
+          quote do
+            unquote(zeta())
+          end
+        end
+
+        def zeta, do: :ok
+
+        def beta, do: mac()
+
+        def alpha, do: :a
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "same-name macro arities pin each other without suppressing the sort" do
+      # `pad/1` and `pad/2` are separate groups, and each one's name occurs in
+      # the other's defining head - that pins both (a bare occurrence can't be
+      # told apart from a use) but a definition isn't an expansion, so the
+      # inert `zeta` still sorts.
+      source = """
+      defmodule M do
+        defmacro pad(x), do: x
+
+        defmacro pad(x, y) do
+          quote do
+            unquote(x) <> unquote(y)
+          end
+        end
+
+        defmacro zeta(x), do: x
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro pad(x), do: x
+
+        defmacro pad(x, y) do
+          quote do
+            unquote(x) <> unquote(y)
+          end
+        end
+
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmacro zeta(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "an expanded macro evaluating a private via bind_quoted bails the module" do
+      # `bind_quoted:` values evaluate at expansion, the same constraint as
+      # `unquote(helper())`.
+      source = """
+      defmodule M do
+        defmacro mac do
+          quote bind_quoted: [x: helper()] do
+            x
+          end
+        end
+
+        defp helper, do: :ok
+
+        def beta, do: mac()
+
+        def alpha, do: :a
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a quote with a non-literal opts argument doesn't crash the scan" do
+      # `quote(unquote(opts), do: ...)` is "unquote called outside quote" at
+      # compile time, but it parses, and a formatter must survive anything
+      # parseable. The do-block stays treated as quoted, so the module lays
+      # out normally.
+      source = """
+      defmodule M do
+        defmacro mac(opts) do
+          quote(unquote(opts), do: helper())
+        end
+
+        defp helper, do: :ok
+
+        def beta, do: mac([])
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro mac(opts) do
+          quote(unquote(opts), do: helper())
+        end
+
+        def alpha, do: :a
+
+        def beta, do: mac([])
+
+        defp helper, do: :ok
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a macro expanded from a default argument creates the same constraints" do
+      # `def beta(x \\ mac())` expands `mac` while `beta` compiles - a default
+      # is an expansion-time position, exactly like a body call. `mac`'s own
+      # expansion calls `helper` at expansion time, so the module bails.
+      source = """
+      defmodule M do
+        defmacro mac do
+          quote do
+            unquote(helper())
+          end
+        end
+
+        defp helper, do: :ok
+
+        def beta(x \\\\ mac()), do: x
+
+        def alpha, do: :a
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a macro expanded from a guard's default argument suppresses sorting" do
+      # Defaults on defguard heads expand at definition too: `one()` runs while
+      # `is_one` compiles and its expansion could hide a call to `zeta`, so
+      # `zeta` must not sort below the guard.
+      source = """
+      defmodule M do
+        defmacro zeta, do: 1
+
+        defmacro one do
+          name = String.to_atom("zeta")
+          call = {name, [], []}
+
+          quote do
+            unquote(call)
+          end
+        end
+
+        defguard is_one(x \\\\ one()) when x == 1
+
+        def beta, do: is_one()
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro zeta, do: 1
+
+        defmacro one do
+          name = String.to_atom("zeta")
+          call = {name, [], []}
+
+          quote do
+            unquote(call)
+          end
+        end
+
+        defguard is_one(x \\\\ one()) when x == 1
+
+        def alpha, do: :a
+
+        def beta, do: is_one()
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a macro referenced only inside quotes triggers no closure" do
+      # `pinned_by_quote` is pinned (doubt resolves to used) but never expands during
+      # this module's compile - its references live in quoted code that runs
+      # elsewhere - so it can't hide anything and `zeta` still sorts.
+      source = """
+      defmodule M do
+        defmacro pinned_by_quote(x), do: x
+
+        defmacro zeta(x), do: x
+
+        def beta do
+          quote do
+            pinned_by_quote(1)
+          end
+        end
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro pinned_by_quote(x), do: x
+
+        def alpha, do: :a
+
+        def beta do
+          quote do
+            pinned_by_quote(1)
+          end
+        end
+
+        defmacro zeta(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a private macro never sorts, even when nothing references it" do
+      # An unused defmacrop/defguardp is a compiler warning, so in
+      # warnings-clean code private compile-time definitions are always used:
+      # they pin (or bail below the first def) regardless of what the scan
+      # finds.
+      source = """
+      defmodule M do
+        defmacrop unused_helper(x), do: x
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacrop unused_helper(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
     end
   end
 

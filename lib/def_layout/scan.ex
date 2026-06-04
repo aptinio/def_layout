@@ -2,6 +2,8 @@ defmodule DefLayout.Scan do
   @moduledoc false
 
   @def_kinds [:def, :defp]
+  @macro_kinds [:defmacro, :defmacrop, :defguard, :defguardp]
+  @group_kinds @def_kinds ++ @macro_kinds
   @attaching_attrs [:doc, :spec, :impl, :deprecated, :dialyzer]
   @attaching_macros [:attr, :slot]
 
@@ -20,8 +22,9 @@ defmodule DefLayout.Scan do
 
   @type def_group :: %{
           key: {atom, non_neg_integer},
-          kind: :def | :defp,
+          kind: :def | :defp | :defmacro | :defmacrop | :defguard | :defguardp,
           callback?: boolean,
+          pinned?: boolean,
           calls: [{atom, non_neg_integer}],
           start: pos_integer,
           stop: pos_integer,
@@ -31,18 +34,206 @@ defmodule DefLayout.Scan do
   # Slices a module body into ordered def_groups carrying their verbatim
   # source-line span. Returns :error (the caller bails, leaving the module
   # untouched) for anything it can't safely move: a non-function expression
-  # interleaved among the functions, non-adjacent duplicate-key clauses, or a
-  # header with an unrecognized module-level construct.
+  # interleaved among the functions, a used macro/guard below the first
+  # def/defp, non-adjacent duplicate-key clauses, or a header with an
+  # unrecognized module-level construct.
   @spec def_groups([Macro.t()], pos_integer, [String.t()]) :: {:ok, [def_group]} | :error
   def def_groups(exprs, do_line, source_lines) do
     with {:ok, header, groups} <- partition(exprs),
-         true <- header_safe?(header) do
+         true <- header_safe?(header),
+         {:ok, pinned_keys} <- classify_pinned(header, groups) do
       header_stop = Enum.max([do_line | Enum.map(header, &max_line/1)])
-      {:ok, materialize(header_stop, groups, source_lines)}
+      {:ok, materialize(header_stop, groups, pinned_keys, source_lines)}
     else
       _ -> :error
     end
   end
+
+  # Compile-time definitions (macros/guards) are define-before-use, so their
+  # position is load-bearing exactly when the module uses them - which also
+  # pushes them above the first def. Used ones pin: `DefLayout.Engine` keeps
+  # them first, in source order. A provably inert public macro/guard is just a
+  # public and sorts with the rest. Used *below* the first def/defp could only
+  # move (or have defs permute around it) safely with edge-accurate call
+  # detection, where a scanner miss is a compile error rather than a cosmetic
+  # miss, so bail instead.
+  #
+  # Inert is decided by a conservative whole-module scan: the macro's name
+  # occurs nowhere outside its own group, and its own group references no
+  # in-module compile-time name. Every doubt - quote contents, variables or
+  # atom literals sharing the name - resolves to "used", so the failure
+  # direction is over-pinning, never a broken build. Private macros/guards
+  # never sort: an unused defmacrop/defguardp is a compiler warning, so in
+  # warnings-clean code they're always used.
+  defp classify_pinned(header, groups) do
+    group_refs = Enum.map(groups, fn {_key, exprs} -> referenced_names(exprs) end)
+    header_refs = referenced_names(header)
+
+    macro_names =
+      for {{name, _arity}, _exprs} = group <- groups,
+          macro_group?(group),
+          into: MapSet.new(),
+          do: name
+
+    pinned_keys =
+      for {{{name, _arity} = key, exprs} = group, index} <- Enum.with_index(groups),
+          macro_group?(group),
+          def_kind_of(exprs) in [:defmacrop, :defguardp] or
+            not inert?(name, index, {header_refs, group_refs}, macro_names),
+          into: MapSet.new(),
+          do: key
+
+    with {:ok, pinned_keys} <- close_expansions(groups, pinned_keys) do
+      first_def_index =
+        Enum.find_index(groups, fn group -> not macro_group?(group) end) || length(groups)
+
+      pinned_below_first_def? =
+        groups
+        |> Enum.with_index()
+        |> Enum.any?(fn {{key, _exprs}, index} ->
+          index > first_def_index and MapSet.member?(pinned_keys, key)
+        end)
+
+      if pinned_below_first_def?, do: :error, else: {:ok, pinned_keys}
+    end
+  end
+
+  # A pinned defmacro referenced in an expansion-time position runs during
+  # this module's compile, and an expansion is arbitrary code the syntactic
+  # scan can't see into. Two consequences, both closed here: the expansion
+  # could invoke a sorted macro by a name computed at expansion time, so no
+  # macro may sort (every macro pins); and any def/defp the pin's own
+  # expansion-time code calls must stay above the expansion site - a
+  # constraint placement can't honor, so bail. Macros referenced only inside
+  # quotes never expand here (quoted code runs at the expansion site's
+  # runtime), an expanded guard is just a substitution of syntax the scan
+  # already saw, and the header can't expand a macro at all (its expressions
+  # evaluate above every macro definition - compile error), so none of those
+  # trigger. Both break shapes were verified to compile in source order and
+  # fail when sorted/tailed.
+  defp close_expansions(groups, pinned_keys) do
+    group_exp = Enum.map(groups, fn {_key, exprs} -> expansion_time_names(exprs) end)
+
+    expanded_pins =
+      for {{{name, _arity} = key, exprs}, index} <- Enum.with_index(groups),
+          MapSet.member?(pinned_keys, key),
+          def_kind_of(exprs) in [:defmacro, :defmacrop],
+          group_exp
+          |> List.delete_at(index)
+          |> Enum.any?(&MapSet.member?(&1, name)),
+          do: index
+
+    def_names =
+      for {{name, _arity}, exprs} <- groups,
+          def_kind_of(exprs) in @def_kinds,
+          into: MapSet.new(),
+          do: name
+
+    cond do
+      expanded_pins == [] ->
+        {:ok, pinned_keys}
+
+      Enum.any?(expanded_pins, &(not MapSet.disjoint?(Enum.fetch!(group_exp, &1), def_names))) ->
+        :error
+
+      true ->
+        {:ok, for({key, _exprs} = group <- groups, macro_group?(group), into: MapSet.new(), do: key)}
+    end
+  end
+
+  defp inert?(name, index, {header_refs, group_refs}, macro_names) do
+    own_refs = Enum.fetch!(group_refs, index)
+    other_refs = List.delete_at(group_refs, index)
+
+    not Enum.any?([header_refs | other_refs], &(name in &1)) and
+      MapSet.disjoint?(own_refs, MapSet.delete(macro_names, name))
+  end
+
+  defp macro_group?({_key, exprs}), do: def_kind_of(exprs) in @macro_kinds
+
+  # Every atom the AST mentions - call heads, bare names and variables,
+  # literal atoms, quote contents. Nameless invocation forms need no special
+  # handling: a non-quoted in-module use/import/require of the module itself
+  # is a compile error ("currently being defined", so `__using__`'s position
+  # is never load-bearing here), `@before_compile __MODULE__` and
+  # `@on_definition __MODULE__` are compile errors for the same reason, and
+  # `@after_compile`/`@after_verify` self-hooks target plain functions, whose
+  # position is free. All verified empirically.
+  defp referenced_names(ast) do
+    {_node, names} =
+      Macro.prewalk(ast, MapSet.new(), fn
+        {name, _, _} = node, acc when is_atom(name) ->
+          {node, MapSet.put(acc, name)}
+
+        node, acc when is_atom(node) ->
+          {node, MapSet.put(acc, node)}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    names
+  end
+
+  # Call-shaped names evaluated when this code runs at macro expansion:
+  # everything outside `quote`, plus `unquote`/`unquote_splicing` fragments
+  # and a quote's opts (`bind_quoted:` values) within one. Code that's merely
+  # quoted runs at the expansion site's runtime instead, so it imposes no
+  # define-before-use constraint here.
+  defp expansion_time_names(exprs) do
+    exprs
+    |> Enum.filter(&def_expr?/1)
+    |> Enum.reduce(MapSet.new(), fn {_kind, _, [head | body]}, acc ->
+      acc = exp_names(head_expansion_terms(head), false, acc)
+      Enum.reduce(body, acc, &exp_names(&1, false, &2))
+    end)
+  end
+
+  # A head contributes its guard and its default-argument expressions - a
+  # macro in either expands when the def compiles (verified: `x \\ mac()`
+  # errors at definition when `mac` isn't defined yet). The defining call
+  # isn't a use of its own name, and argument patterns aren't expansion-time
+  # code.
+  defp head_expansion_terms({:when, _, [call | guards]}), do: guards ++ argument_defaults(call)
+  defp head_expansion_terms(head), do: argument_defaults(head)
+
+  defp argument_defaults({_name, _, args}) when is_list(args) do
+    for {:\\, _, [_pattern, default]} <- args, do: default
+  end
+
+  defp argument_defaults(_head), do: []
+
+  defp exp_names({:quote, _, args}, false, acc) when is_list(args) do
+    Enum.reduce(args, acc, fn
+      arg, acc when is_list(arg) ->
+        Enum.reduce(arg, acc, fn
+          {:do, block}, acc -> exp_names(block, true, acc)
+          other, acc -> exp_names(other, false, acc)
+        end)
+
+      arg, acc ->
+        exp_names(arg, false, acc)
+    end)
+  end
+
+  defp exp_names({unquote_kind, _, [expr]}, true, acc) when unquote_kind in [:unquote, :unquote_splicing],
+    do: exp_names(expr, false, acc)
+
+  # A local capture evaluated at expansion requires the function defined too.
+  defp exp_names({:&, _, [{:/, _, [{name, _, ctx}, arity]}]}, false, acc)
+       when is_atom(name) and is_atom(ctx) and is_integer(arity), do: MapSet.put(acc, name)
+
+  defp exp_names({name, _, args}, false, acc) when is_atom(name) and is_list(args),
+    do: Enum.reduce(args, MapSet.put(acc, name), &exp_names(&1, false, &2))
+
+  defp exp_names({head, _, args}, quoted?, acc) when is_list(args),
+    do: Enum.reduce([head | args], acc, &exp_names(&1, quoted?, &2))
+
+  defp exp_names({a, b}, quoted?, acc), do: exp_names(b, quoted?, exp_names(a, quoted?, acc))
+
+  defp exp_names(list, quoted?, acc) when is_list(list), do: Enum.reduce(list, acc, &exp_names(&1, quoted?, &2))
+
+  defp exp_names(_other, _quoted?, acc), do: acc
 
   defp partition(exprs) do
     {header, rest} = Enum.split_while(exprs, &(not def_group_part?(&1)))
@@ -106,7 +297,7 @@ defmodule DefLayout.Scan do
   # capture leading comments. The gap above a group (between it and the previous
   # group, or the header) belongs to it from its first comment line down, so
   # free-floating comments ride along rather than being dropped.
-  defp materialize(header_stop, groups, source_lines) do
+  defp materialize(header_stop, groups, pinned_keys, source_lines) do
     {def_groups, _prev_stop} =
       Enum.reduce(groups, {[], header_stop}, fn {key, exprs}, {acc, prev_stop} ->
         first_expr_line =
@@ -126,6 +317,7 @@ defmodule DefLayout.Scan do
           key: key,
           kind: def_kind_of(exprs),
           callback?: callback_group?(exprs),
+          pinned?: MapSet.member?(pinned_keys, key),
           calls: calls_in(exprs),
           start: group_start,
           stop: group_stop,
@@ -207,14 +399,14 @@ defmodule DefLayout.Scan do
 
   defp unpipe(node), do: node
 
-  defp def_group_part?({kind, _, _}) when kind in @def_kinds, do: true
+  defp def_group_part?({kind, _, _}) when kind in @group_kinds, do: true
   defp def_group_part?({:@, _, [{name, _, _}]}) when name in @attaching_attrs, do: true
 
   defp def_group_part?({macro, _, args}) when macro in @attaching_macros and is_list(args), do: true
 
   defp def_group_part?(_), do: false
 
-  defp def_expr?({kind, _, _}) when kind in @def_kinds, do: true
+  defp def_expr?({kind, _, _}) when kind in @group_kinds, do: true
   defp def_expr?(_), do: false
 
   defp key_of({_kind, _, [head | _]}), do: head_name_arity(head)

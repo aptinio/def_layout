@@ -1,14 +1,15 @@
 defmodule DefLayout.Engine do
   @moduledoc false
 
-  # Roots are the public defs: callbacks (`@impl`) first in source order - their
-  # lifecycle order (init/mount/terminate) is meaningful, so it's preserved, not
-  # alphabetized - then the remaining publics alphabetical by `{name, arity}`.
-  # Each private sinks just below its bottom-most caller (the caller that lands
-  # lowest in the final layout), recursively: a private called only by another
-  # private rides below that private. A private called by a callback anchors below
-  # that callback. Co-anchored privates (several under one caller) follow the
-  # caller's first-call-site order.
+  # Roots, top to bottom: pinned macros/guards in source order (define-before-use
+  # makes their position load-bearing), then callbacks (`@impl`) in source order -
+  # their lifecycle order (init/mount/terminate) is meaningful, so it's preserved,
+  # not alphabetized - then the remaining publics, inert macros among them,
+  # alphabetical by `{name, arity}`. Each private sinks just below its bottom-most
+  # caller (the caller that lands lowest in the final layout), recursively: a
+  # private called only by another private rides below that private. A private
+  # called by a callback anchors below that callback. Co-anchored privates
+  # (several under one caller) follow the caller's first-call-site order.
   #
   # Privates are placed in topological waves - a private is ready once every one
   # of its callers is already placed - so "bottom-most" reads off the order built
@@ -19,9 +20,10 @@ defmodule DefLayout.Engine do
   @spec order([DefLayout.Scan.def_group()]) :: [DefLayout.Scan.def_group()]
   def order(def_groups) do
     by_key = Map.new(def_groups, &{&1.key, &1})
-    callbacks = for g <- def_groups, g.kind == :def, g.callback?, do: g.key
-    publics = for g <- def_groups, g.kind == :def, not g.callback?, do: g.key
-    roots = callbacks ++ Enum.sort_by(publics, &sort_key(by_key, &1))
+    pins = for g <- def_groups, g.pinned?, do: g.key
+    callbacks = for g <- def_groups, not g.pinned?, g.kind != :defp, g.callback?, do: g.key
+    publics = for g <- def_groups, not g.pinned?, g.kind != :defp, not g.callback?, do: g.key
+    roots = pins ++ callbacks ++ Enum.sort_by(publics, &sort_key(by_key, &1))
     privates = for g <- def_groups, g.kind == :defp, do: g.key
 
     {children, placed} = anchor(privates, by_key, roots, %{}, MapSet.new(roots))
@@ -147,7 +149,10 @@ defmodule DefLayout.Engine do
     |> Enum.max_by(fn caller -> Enum.find_index(order, &(&1 == caller)) end)
   end
 
+  # Pins never anchor: a private lifted into the pinned tier could land above
+  # a later pin it uses, where a missed call edge is a compile error. A private
+  # referenced only from a pin falls back to the orphan tail.
   defp callers_of(key, by_key) do
-    for {caller, g} <- by_key, key != caller, key in g.calls, do: caller
+    for {caller, g} <- by_key, key != caller, not g.pinned?, key in g.calls, do: caller
   end
 end

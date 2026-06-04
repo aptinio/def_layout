@@ -3,10 +3,11 @@ defmodule DefLayout.PropertyTest do
   use ExUnitProperties
 
   # Property companion to the example-based `idempotency` tests: generates
-  # scrambled `def`/`defp` modules with random call edges to exercise the
-  # ordering engine (anchoring, cycles, orphans, callbacks). Bodies are kept
-  # trivial so the base `Code.format_string!` is itself a fixed point, leaving
-  # the property to test DefLayout's reordering alone.
+  # scrambled modules over the whole def* family with random call edges to
+  # exercise the ordering engine (anchoring, cycles, orphans, callbacks, macro
+  # pinning and inert sorting). Bodies are kept trivial so the base
+  # `Code.format_string!` is itself a fixed point, leaving the property to
+  # test DefLayout's reordering alone.
 
   @names [:a, :b, :c, :d, :e, :f]
   @arities [0, 1, 2]
@@ -90,11 +91,11 @@ defmodule DefLayout.PropertyTest do
       end
 
     gen all(
-          kind <- member_of([:def, :defp]),
+          kind <- member_of([:def, :defp, :defmacro, :defmacrop, :defguard, :defguardp]),
           impl? <- boolean(),
           calls <- calls_gen
         ) do
-      %{key: key, kind: kind, callback?: kind == :def and impl?, calls: calls}
+      %{key: key, kind: kind, callback?: kind in [:def, :defmacro] and impl?, calls: calls}
     end
   end
 
@@ -107,8 +108,25 @@ defmodule DefLayout.PropertyTest do
   defp render_fun(%{key: {name, arity}, kind: kind, callback?: callback?, calls: calls}) do
     impl = if callback?, do: "@impl true\n", else: ""
     body = Enum.map_join(calls, "", &"#{render_call(&1)}\n") <> ":ok"
-    "#{impl}#{kind} #{name}#{params(arity)} do\n#{body}\nend"
+
+    cond do
+      kind in [:defguard, :defguardp] ->
+        "#{impl}#{kind} #{name}#{params(arity)} when #{guard_expr(arity)}"
+
+      kind in [:defmacro, :defmacrop] ->
+        # Calls live inside a quote: quoted code imposes no expansion-time
+        # constraint, so a referenced macro pins (or an unreferenced one
+        # sorts) instead of the module bailing, and the quote's calls
+        # exercise private anchoring under macros.
+        "#{impl}#{kind} #{name}#{params(arity)} do\nquote do\n#{body}\nend\nend"
+
+      true ->
+        "#{impl}#{kind} #{name}#{params(arity)} do\n#{body}\nend"
+    end
   end
+
+  defp guard_expr(0), do: "1 > 0"
+  defp guard_expr(_arity), do: "arg0 > 0"
 
   # Parens are always emitted so each call is a real local-call edge: a bare
   # zero-arity name (no parens) is AST-identical to a variable and deliberately
