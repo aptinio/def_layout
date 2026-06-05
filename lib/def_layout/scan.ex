@@ -298,6 +298,8 @@ defmodule DefLayout.Scan do
   # group, or the header) belongs to it from its first comment line down, so
   # free-floating comments ride along rather than being dropped.
   defp materialize(header_stop, groups, pinned_keys, source_lines) do
+    ranges = arity_ranges(groups)
+
     {def_groups, _prev_stop} =
       Enum.reduce(groups, {[], header_stop}, fn {key, exprs}, {acc, prev_stop} ->
         first_expr_line =
@@ -318,7 +320,7 @@ defmodule DefLayout.Scan do
           kind: def_kind_of(exprs),
           callback?: callback_group?(exprs),
           pinned?: MapSet.member?(pinned_keys, key),
-          calls: calls_in(exprs),
+          calls: calls_in(exprs, ranges),
           start: group_start,
           stop: group_stop,
           lines: lines
@@ -359,15 +361,67 @@ defmodule DefLayout.Scan do
   defp callback_impl?({:@, _, [{:impl, _, [_value]}]}), do: true
   defp callback_impl?(_), do: false
 
-  # The `{name, arity}` local calls in a group's clause bodies, in first-call-site
-  # order (dedup keeps the earliest). Heads/guards are skipped (we walk only the
-  # args after the head), so a group never lists itself, and `@doc`/`@spec`/macros
-  # contribute nothing. Drives caller-anchoring in `DefLayout.Engine`.
-  defp calls_in(exprs) do
+  # The `{name, arity}` local calls in a group's clause bodies and argument
+  # defaults (a default lands in the generated reduced-arity clause, so a call
+  # there is a real runtime edge), in first-call-site order (dedup keeps the
+  # earliest). The defining head and guards aren't uses, attachments
+  # (`@doc`/`@spec`/`attr`/`slot`) contribute nothing, and a recursive body's
+  # self-edge is ignored by the engine. Each call resolves against the module's
+  # arity ranges so a call through a defaulted head lands on the defining
+  # group's key. Drives caller-anchoring in `DefLayout.Engine`.
+  defp calls_in(exprs, ranges) do
     exprs
     |> Enum.filter(&def_expr?/1)
-    |> Enum.flat_map(fn {_kind, _, [_head | body]} -> collect_calls(body) end)
+    |> Enum.flat_map(fn {_kind, _, [head | body]} ->
+      default_calls(head) ++ collect_calls(body)
+    end)
+    |> Enum.map(&resolve_call(&1, ranges))
     |> Enum.uniq()
+  end
+
+  defp default_calls(head) do
+    head
+    |> head_call()
+    |> argument_defaults()
+    |> collect_calls()
+  end
+
+  # A head with defaults defines every arity from full-minus-defaults to full.
+  defp arity_ranges(groups) do
+    for {{name, arity} = key, exprs} <- groups do
+      {name, arity - max_default_count(exprs), arity, key}
+    end
+  end
+
+  defp max_default_count(exprs) do
+    exprs
+    |> Enum.filter(&def_expr?/1)
+    |> Enum.map(fn {_kind, _, [head | _]} ->
+      head
+      |> head_call()
+      |> argument_defaults()
+      |> length()
+    end)
+    |> Enum.max()
+  end
+
+  defp head_call({:when, _, [call | _]}), do: call
+  defp head_call(head), do: head
+
+  # A call inside a group's arity range resolves to that group's key. Among
+  # overlapping ranges (a defaults conflict the compiler rejects anyway) the
+  # lowest full arity wins - the exact-arity group when one exists - keeping
+  # the choice independent of source order, which keeps reordering idempotent.
+  defp resolve_call({name, arity} = call, ranges) do
+    case for({^name, min, max, key} <- ranges, arity >= min, arity <= max, do: {max, key}) do
+      [] ->
+        call
+
+      candidates ->
+        candidates
+        |> Enum.min()
+        |> elem(1)
+    end
   end
 
   defp collect_calls(ast) do

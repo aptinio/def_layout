@@ -1068,6 +1068,45 @@ defmodule DefLayoutTest do
 
       assert format(source) == expected
     end
+
+    test "arity-range resolution does not make a pin anchor a defaulted private" do
+      # Same shape with a defaulted head: the quoted `helper()` now resolves
+      # into `helper/1`'s range, but pins still never anchor, so the private
+      # still tails instead of landing under the macro.
+      source = """
+      defmodule M do
+        defmacro mac do
+          quote do
+            helper()
+          end
+        end
+
+        def beta, do: mac()
+
+        def alpha, do: :a
+
+        defp helper(x \\\\ :ok), do: x
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro mac do
+          quote do
+            helper()
+          end
+        end
+
+        def alpha, do: :a
+
+        def beta, do: mac()
+
+        defp helper(x \\\\ :ok), do: x
+      end
+      """
+
+      assert format(source) == expected
+    end
   end
 
   describe "silent bail (interleaved attribute)" do
@@ -2334,18 +2373,11 @@ defmodule DefLayoutTest do
 
       assert format(source) == expected
     end
-  end
 
-  # Known scanner limitations: the call-graph is built from source AST without
-  # arity-range or scope analysis, so a few constructs anchor a private somewhere
-  # other than its true caller. None corrupt or crash - the layout stays a fixed
-  # point - so these lock the current SAFE behavior against silent regression.
-  describe "scanner limitations (safe mis-placement)" do
-    test "a default-arg private called at a lower arity tails as an orphan" do
-      # `helper/1` (one defaulted param) called as `helper()` records a `helper/0`
-      # edge, which doesn't match the `helper/1` key - so the call graph sees no
-      # caller and `helper` sinks to the module tail instead of under `alpha`.
-      # Safe: orphan fallback, never corruption. (Fixable later via arity ranges.)
+    test "a private with a defaulted argument called without it anchors below its caller" do
+      # `helper/1` (one defaulted param) also defines `helper/0`, so the
+      # `helper()` call resolves into the head's arity range and the call graph
+      # sees the caller instead of orphan-tailing the private.
       source = """
       defmodule M do
         defp helper(x \\\\ :ok) do
@@ -2368,8 +2400,327 @@ defmodule DefLayoutTest do
           helper()
         end
 
+        defp helper(x \\\\ :ok) do
+          x
+        end
+
         def zebra do
           :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defaulted private called at a middle arity anchors below its caller" do
+      source = """
+      defmodule M do
+        defp helper(a, b \\\\ 1, c \\\\ 2) do
+          {a, b, c}
+        end
+
+        def alpha do
+          helper(:x, :y)
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          helper(:x, :y)
+        end
+
+        defp helper(a, b \\\\ 1, c \\\\ 2) do
+          {a, b, c}
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a leading default counts toward the arity range" do
+      source = """
+      defmodule M do
+        defp helper(a \\\\ :none, b) do
+          {a, b}
+        end
+
+        def alpha do
+          helper(:x)
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          helper(:x)
+        end
+
+        defp helper(a \\\\ :none, b) do
+          {a, b}
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a reduced-arity capture anchors below the capturing caller" do
+      source = """
+      defmodule M do
+        defp helper(a, b \\\\ :ok) do
+          {a, b}
+        end
+
+        def alpha(list) do
+          Enum.map(list, &helper/1)
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha(list) do
+          Enum.map(list, &helper/1)
+        end
+
+        defp helper(a, b \\\\ :ok) do
+          {a, b}
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a multi-clause private with a defaults-declaring head anchors as one group" do
+      source = """
+      defmodule M do
+        defp helper(a, b \\\\ :ok)
+
+        defp helper(:special, b) do
+          b
+        end
+
+        defp helper(a, _b) do
+          a
+        end
+
+        def alpha do
+          helper(:x)
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          helper(:x)
+        end
+
+        defp helper(a, b \\\\ :ok)
+
+        defp helper(:special, b) do
+          b
+        end
+
+        defp helper(a, _b) do
+          a
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "the bottom-most caller wins across mixed call arities" do
+      # The bottom-most caller reaches `helper` through the defaulted arity; if
+      # that edge went unseen, `helper` would anchor under `alpha` instead.
+      source = """
+      defmodule M do
+        defp helper(x \\\\ :ok) do
+          x
+        end
+
+        def alpha do
+          helper(:x)
+        end
+
+        def zebra do
+          helper()
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          helper(:x)
+        end
+
+        def zebra do
+          helper()
+        end
+
+        defp helper(x \\\\ :ok) do
+          x
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a cycle joined through defaulted calls anchors and stays idempotent" do
+      source = """
+      defmodule M do
+        defp pong(x \\\\ :a) do
+          ping()
+        end
+
+        defp ping(x \\\\ 0) do
+          pong()
+        end
+
+        def run do
+          ping(1)
+        end
+
+        def zzz do
+          :ok
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def run do
+          ping(1)
+        end
+
+        defp ping(x \\\\ 0) do
+          pong()
+        end
+
+        defp pong(x \\\\ :a) do
+          ping()
+        end
+
+        def zzz do
+          :ok
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a private called from a def's argument default anchors below it" do
+      # A default expression lands in the generated reduced-arity clause, so
+      # the call is a real runtime edge from the defaulted function.
+      source = """
+      defmodule M do
+        defp fallback do
+          :fb
+        end
+
+        def fetch(key \\\\ fallback()) do
+          key
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def fetch(key \\\\ fallback()) do
+          key
+        end
+
+        defp fallback do
+          :fb
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "overlapping defaulted ranges resolve to the exact arity, independent of source order" do
+      # `def helper` and the defaulted `defp helper(x \\ :ok)` both define
+      # `helper/0` - a defaults conflict the compiler rejects, but WIP source
+      # still gets formatted, so resolution must not read source order (which
+      # changes between passes - the cycle-break lesson). The exact-arity
+      # group wins: `helper()` is the public's, and the defp orphan-tails.
+      source = """
+      defmodule M do
+        defp helper(x \\\\ :ok) do
+          x
+        end
+
+        def helper do
+          :zero
+        end
+
+        def alpha do
+          helper()
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          helper()
+        end
+
+        def helper do
+          :zero
         end
 
         defp helper(x \\\\ :ok) do
@@ -2381,7 +2732,13 @@ defmodule DefLayoutTest do
       assert format(source) == expected
       assert format(expected) == expected
     end
+  end
 
+  # Known scanner limitations: the call-graph is built from source AST without
+  # scope analysis, so a few constructs anchor a private somewhere other than
+  # its true caller. None corrupt or crash - the layout stays a fixed point -
+  # so these lock the current SAFE behavior against silent regression.
+  describe "scanner limitations (safe mis-placement)" do
     test "a name referenced only inside a quote is over-collected as a call edge" do
       # `gen`'s body returns `quote(do: leaf())` - quoted code, not a runtime call -
       # but `collect_calls` is name-blind and records a `gen -> leaf` edge anyway.
@@ -2429,6 +2786,59 @@ defmodule DefLayoutTest do
 
         defp leaf do
           :leaf
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defaulted name inside a quote is over-collected as a call edge" do
+      # Same class as above, reached through arity-range resolution: the quoted
+      # `leaf()` resolves into `leaf/1`'s defaulted range, so `gen` counts as a
+      # caller and wins bottom-most - where the arity mismatch used to mask the
+      # spurious edge and `leaf` anchored under `aaa`. Safe mis-anchor, idempotent.
+      source = """
+      defmodule M do
+        defp leaf(x \\\\ :ok) do
+          x
+        end
+
+        defp gen do
+          quote do
+            leaf()
+          end
+        end
+
+        def aaa do
+          leaf(:x)
+        end
+
+        def zzz do
+          gen()
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def aaa do
+          leaf(:x)
+        end
+
+        def zzz do
+          gen()
+        end
+
+        defp gen do
+          quote do
+            leaf()
+          end
+        end
+
+        defp leaf(x \\\\ :ok) do
+          x
         end
       end
       """

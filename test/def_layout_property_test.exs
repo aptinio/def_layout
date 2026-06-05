@@ -5,9 +5,10 @@ defmodule DefLayout.PropertyTest do
   # Property companion to the example-based `idempotency` tests: generates
   # scrambled modules over the whole def* family with random call edges to
   # exercise the ordering engine (anchoring, cycles, orphans, callbacks, macro
-  # pinning and inert sorting). Bodies are kept trivial so the base
-  # `Code.format_string!` is itself a fixed point, leaving the property to
-  # test DefLayout's reordering alone.
+  # pinning, inert sorting, and arity-range resolution through defaulted
+  # heads). Bodies are kept trivial so the base `Code.format_string!` is
+  # itself a fixed point, leaving the property to test DefLayout's reordering
+  # alone.
 
   @names [:a, :b, :c, :d, :e, :f]
   @arities [0, 1, 2]
@@ -83,45 +84,54 @@ defmodule DefLayout.PropertyTest do
 
     # Plain list_of (not uniq): duplicate call edges are harmless - Scan dedups
     # calls - and requiring uniqueness over a tiny `others` space overflows
-    # StreamData's duplicate budget.
+    # StreamData's duplicate budget. The boolean alongside each callee asks the
+    # call site to drop a defaulted argument when the callee has one.
     calls_gen =
       case others do
         [] -> constant([])
-        _ -> list_of(member_of(others), max_length: 3)
+        _ -> list_of(tuple({member_of(others), boolean()}), max_length: 3)
       end
 
     gen all(
           kind <- member_of([:def, :defp, :defmacro, :defmacrop, :defguard, :defguardp]),
           impl? <- boolean(),
+          defaulted? <- boolean(),
           calls <- calls_gen
         ) do
-      %{key: key, kind: kind, callback?: kind in [:def, :defmacro] and impl?, calls: calls}
+      %{
+        key: key,
+        kind: kind,
+        callback?: kind in [:def, :defmacro] and impl?,
+        defaulted?: defaulted? and elem(key, 1) > 0,
+        calls: calls
+      }
     end
   end
 
   defp render(header, specs) do
-    body = Enum.join(header ++ Enum.map(specs, &render_fun/1), "\n\n")
+    by_key = Map.new(specs, &{&1.key, &1})
+    body = Enum.join(header ++ Enum.map(specs, &render_fun(&1, by_key)), "\n\n")
 
     "defmodule M do\n" <> body <> "\nend\n"
   end
 
-  defp render_fun(%{key: {name, arity}, kind: kind, callback?: callback?, calls: calls}) do
+  defp render_fun(%{key: {name, arity}, kind: kind, callback?: callback?, calls: calls} = spec, by_key) do
     impl = if callback?, do: "@impl true\n", else: ""
-    body = Enum.map_join(calls, "", &"#{render_call(&1)}\n") <> ":ok"
+    body = Enum.map_join(calls, "", &"#{render_call(&1, by_key)}\n") <> ":ok"
 
     cond do
       kind in [:defguard, :defguardp] ->
-        "#{impl}#{kind} #{name}#{params(arity)} when #{guard_expr(arity)}"
+        "#{impl}#{kind} #{name}#{params(spec)} when #{guard_expr(arity)}"
 
       kind in [:defmacro, :defmacrop] ->
         # Calls live inside a quote: quoted code imposes no expansion-time
         # constraint, so a referenced macro pins (or an unreferenced one
         # sorts) instead of the module bailing, and the quote's calls
         # exercise private anchoring under macros.
-        "#{impl}#{kind} #{name}#{params(arity)} do\nquote do\n#{body}\nend\nend"
+        "#{impl}#{kind} #{name}#{params(spec)} do\nquote do\n#{body}\nend\nend"
 
       true ->
-        "#{impl}#{kind} #{name}#{params(arity)} do\n#{body}\nend"
+        "#{impl}#{kind} #{name}#{params(spec)} do\n#{body}\nend"
     end
   end
 
@@ -130,9 +140,21 @@ defmodule DefLayout.PropertyTest do
 
   # Parens are always emitted so each call is a real local-call edge: a bare
   # zero-arity name (no parens) is AST-identical to a variable and deliberately
-  # not recorded as an edge, so it would not exercise the call graph.
-  defp render_call({name, arity}), do: "#{name}(#{Enum.map_join(1..arity//1, ", ", fn _ -> "0" end)})"
+  # not recorded as an edge, so it would not exercise the call graph. A call
+  # marked drop? omits the callee's defaulted argument, so the edge only
+  # anchors (or cycles) through arity-range resolution.
+  defp render_call({{name, arity} = key, drop?}, by_key) do
+    arity = if drop? and by_key[key].defaulted?, do: arity - 1, else: arity
 
-  defp params(0), do: ""
-  defp params(arity), do: "(" <> Enum.map_join(0..(arity - 1)//1, ", ", &"arg#{&1}") <> ")"
+    "#{name}(#{Enum.map_join(1..arity//1, ", ", fn _ -> "0" end)})"
+  end
+
+  defp params(%{key: {_name, 0}}), do: ""
+
+  defp params(%{key: {_name, arity}, defaulted?: defaulted?}) do
+    args = Enum.map(0..(arity - 1)//1, &"arg#{&1}")
+    args = if defaulted?, do: List.update_at(args, -1, &(&1 <> " \\\\ 0")), else: args
+
+    "(" <> Enum.join(args, ", ") <> ")"
+  end
 end
