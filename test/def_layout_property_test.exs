@@ -93,7 +93,8 @@ defmodule DefLayout.PropertyTest do
       end
 
     gen all(
-          kind <- member_of([:def, :defp, :defmacro, :defmacrop, :defguard, :defguardp]),
+          kind <-
+            member_of([:def, :defp, :defdelegate, :defmacro, :defmacrop, :defguard, :defguardp]),
           impl? <- boolean(),
           defaulted? <- boolean(),
           calls <- calls_gen
@@ -101,7 +102,7 @@ defmodule DefLayout.PropertyTest do
       %{
         key: key,
         kind: kind,
-        callback?: kind in [:def, :defmacro] and impl?,
+        callback?: kind in [:def, :defdelegate, :defmacro] and impl?,
         defaulted?: defaulted? and elem(key, 1) > 0,
         calls: calls
       }
@@ -120,6 +121,10 @@ defmodule DefLayout.PropertyTest do
     body = Enum.map_join(calls, "", &"#{render_call(&1, by_key)}\n") <> ":ok"
 
     cond do
+      kind == :defdelegate ->
+        # A delegate carries no body, so its generated calls go unrendered.
+        "#{impl}defdelegate #{name}#{params(spec)}, to: Target"
+
       kind in [:defguard, :defguardp] ->
         "#{impl}#{kind} #{name}#{params(spec)} when #{guard_expr(arity)}"
 

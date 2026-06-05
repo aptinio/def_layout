@@ -1854,6 +1854,355 @@ defmodule DefLayoutTest do
   # formatter-stable text: a shape the base formatter rewrites (`;`-joined
   # defs) can't bail on one pass and lay out on the next - a single pass
   # reaches the fixed point.
+  describe "delegates" do
+    test "a defdelegate sorts with the publics by its local name and arity" do
+      source = """
+      defmodule M do
+        def zebra do
+          :zebra
+        end
+
+        defdelegate parse(x), to: String, as: :to_integer
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          :alpha
+        end
+
+        defdelegate parse(x), to: String, as: :to_integer
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a module of only delegates lays out" do
+      source = """
+      defmodule M do
+        defdelegate to_atom(x), to: String
+        defdelegate downcase(x), to: String
+      end
+      """
+
+      # The blank separator between the reordered delegates is synthesized,
+      # as for any dense module.
+      expected = """
+      defmodule M do
+        defdelegate downcase(x), to: String
+
+        defdelegate to_atom(x), to: String
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a delegate's leading comment, @doc and @spec ride along" do
+      source = """
+      defmodule M do
+        # delegates to the parser
+        @doc "Parses the input."
+        @spec parse(term) :: term
+        defdelegate parse(x), to: Parser
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          :alpha
+        end
+
+        # delegates to the parser
+        @doc "Parses the input."
+        @spec parse(term) :: term
+        defdelegate parse(x), to: Parser
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "an @impl delegate joins the callback tier in source order" do
+      source = """
+      defmodule M do
+        def beta do
+          :beta
+        end
+
+        @impl true
+        defdelegate init(arg), to: Impl
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @impl true
+        defdelegate init(arg), to: Impl
+
+        def alpha do
+          :alpha
+        end
+
+        def beta do
+          :beta
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a bare zero-arity delegate sorts at arity zero" do
+      source = """
+      defmodule M do
+        def zebra do
+          :zebra
+        end
+
+        defdelegate version, to: Meta
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          :alpha
+        end
+
+        defdelegate version, to: Meta
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a delegate head's defaults are recognized and the layout is undisturbed" do
+      source = """
+      defmodule M do
+        def zebra do
+          fetch(:key)
+        end
+
+        defdelegate fetch(key, default \\\\ nil), to: Store
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          :alpha
+        end
+
+        defdelegate fetch(key, default \\\\ nil), to: Store
+
+        def zebra do
+          fetch(:key)
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a private anchors below its caller alongside delegates" do
+      source = """
+      defmodule M do
+        defp helper do
+          :ok
+        end
+
+        def zebra do
+          helper()
+        end
+
+        defdelegate parse(x), to: Parser
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha do
+          :alpha
+        end
+
+        defdelegate parse(x), to: Parser
+
+        def zebra do
+          helper()
+        end
+
+        defp helper do
+          :ok
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a macro expanded by a delegate's default pins above it" do
+      # The default expands while the delegate compiles, so `mac` is used -
+      # pinned, in source order - and the delegate sorts below with the publics.
+      source = """
+      defmodule M do
+        defmacro mac, do: 1
+
+        defdelegate foo(a \\\\ mac()), to: Target
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defmacro mac, do: 1
+
+        def alpha do
+          :alpha
+        end
+
+        defdelegate foo(a \\\\ mac()), to: Target
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a private called from a delegate's argument default anchors below it" do
+      # The delegate's options carry no code, but its argument defaults do -
+      # the generated reduced-arity clause calls `fallback` at runtime.
+      source = """
+      defmodule M do
+        defp fallback do
+          :fb
+        end
+
+        defdelegate fetch(key \\\\ fallback()), to: Store
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        defdelegate fetch(key \\\\ fallback()), to: Store
+
+        defp fallback do
+          :fb
+        end
+
+        def zebra do
+          :zebra
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "a used macro below the first delegate bails the module" do
+      # A delegate counts as a def for the pin boundary: a used macro below it
+      # is the same documented used-below-first-def bail.
+      source = """
+      defmodule M do
+        defdelegate parse(x), to: Parser
+
+        defmacro mac, do: 1
+
+        def beta, do: mac()
+
+        def alpha, do: :a
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "an expanded macro calling a delegate at expansion time bails the module" do
+      # A delegate is a local function too: `unquote(zeta())` runs while
+      # `beta` compiles, so the delegate must stay above the expansion site -
+      # the same constraint as a def, which placement can't honor.
+      source = """
+      defmodule M do
+        defmacro mac do
+          quote do
+            unquote(zeta())
+          end
+        end
+
+        defdelegate zeta, to: Target
+
+        def beta, do: mac()
+
+        def alpha, do: :a
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "the deprecated list form bails the module" do
+      # `defdelegate [a(x), b(y)], to: T` warns at compile (deprecated), so it
+      # can't occur in warnings-clean code; the scanner has no single key for
+      # it, and the module keeps its source order.
+      source = """
+      defmodule M do
+        defdelegate [a(x), b(y)], to: Target
+
+        def beta do
+          :beta
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      assert format(source) == source
+    end
+  end
+
   describe "formats before laying out" do
     test "two defs sharing one source line are split and laid out" do
       source = """

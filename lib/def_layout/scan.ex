@@ -2,6 +2,7 @@ defmodule DefLayout.Scan do
   @moduledoc false
 
   @def_kinds [:def, :defp]
+  @delegate_kinds [:defdelegate]
   @macro_kinds [:defmacro, :defmacrop, :defguard, :defguardp]
   @group_kinds @def_kinds ++ @macro_kinds
   @attaching_attrs [:doc, :spec, :impl, :deprecated, :dialyzer]
@@ -22,7 +23,7 @@ defmodule DefLayout.Scan do
 
   @type def_group :: %{
           key: {atom, non_neg_integer},
-          kind: :def | :defp | :defmacro | :defmacrop | :defguard | :defguardp,
+          kind: :def | :defp | :defdelegate | :defmacro | :defmacrop | :defguard | :defguardp,
           callback?: boolean,
           pinned?: boolean,
           calls: [{atom, non_neg_integer}],
@@ -35,8 +36,8 @@ defmodule DefLayout.Scan do
   # source-line span. Returns :error (the caller bails, leaving the module
   # untouched) for anything it can't safely move: a non-function expression
   # interleaved among the functions, a used macro/guard below the first
-  # def/defp, non-adjacent duplicate-key clauses, or a header with an
-  # unrecognized module-level construct.
+  # function definition, non-adjacent duplicate-key clauses, or a header with
+  # an unrecognized module-level construct.
   @spec def_groups([Macro.t()], pos_integer, [String.t()]) :: {:ok, [def_group]} | :error
   def def_groups(exprs, do_line, source_lines) do
     with {:ok, header, groups} <- partition(exprs),
@@ -51,12 +52,12 @@ defmodule DefLayout.Scan do
 
   # Compile-time definitions (macros/guards) are define-before-use, so their
   # position is load-bearing exactly when the module uses them - which also
-  # pushes them above the first def. Used ones pin: `DefLayout.Engine` keeps
-  # them first, in source order. A provably inert public macro/guard is just a
-  # public and sorts with the rest. Used *below* the first def/defp could only
-  # move (or have defs permute around it) safely with edge-accurate call
-  # detection, where a scanner miss is a compile error rather than a cosmetic
-  # miss, so bail instead.
+  # pushes them above the first function. Used ones pin: `DefLayout.Engine`
+  # keeps them first, in source order. A provably inert public macro/guard is
+  # just a public and sorts with the rest. Used *below* the first function
+  # definition could only move (or have defs permute around it) safely with
+  # edge-accurate call detection, where a scanner miss is a compile error
+  # rather than a cosmetic miss, so bail instead.
   #
   # Inert is decided by a conservative whole-module scan: the macro's name
   # occurs nowhere outside its own group, and its own group references no
@@ -102,7 +103,7 @@ defmodule DefLayout.Scan do
   # this module's compile, and an expansion is arbitrary code the syntactic
   # scan can't see into. Two consequences, both closed here: the expansion
   # could invoke a sorted macro by a name computed at expansion time, so no
-  # macro may sort (every macro pins); and any def/defp the pin's own
+  # macro may sort (every macro pins); and any local function the pin's own
   # expansion-time code calls must stay above the expansion site - a
   # constraint placement can't honor, so bail. Macros referenced only inside
   # quotes never expand here (quoted code runs at the expansion site's
@@ -125,7 +126,7 @@ defmodule DefLayout.Scan do
 
     def_names =
       for {{name, _arity}, exprs} <- groups,
-          def_kind_of(exprs) in @def_kinds,
+          def_kind_of(exprs) in (@def_kinds ++ @delegate_kinds),
           into: MapSet.new(),
           do: name
 
@@ -372,8 +373,11 @@ defmodule DefLayout.Scan do
   defp calls_in(exprs, ranges) do
     exprs
     |> Enum.filter(&def_expr?/1)
-    |> Enum.flat_map(fn {_kind, _, [head | body]} ->
-      default_calls(head) ++ collect_calls(body)
+    |> Enum.flat_map(fn
+      # A delegate's "body" is its to:/as: options, not code - only its head
+      # defaults contribute edges.
+      {:defdelegate, _, [head | _]} -> default_calls(head)
+      {_kind, _, [head | body]} -> default_calls(head) ++ collect_calls(body)
     end)
     |> Enum.map(&resolve_call(&1, ranges))
     |> Enum.uniq()
@@ -453,6 +457,7 @@ defmodule DefLayout.Scan do
 
   defp unpipe(node), do: node
 
+  defp def_group_part?({:defdelegate, _, _} = expr), do: def_expr?(expr)
   defp def_group_part?({kind, _, _}) when kind in @group_kinds, do: true
   defp def_group_part?({:@, _, [{name, _, _}]}) when name in @attaching_attrs, do: true
 
@@ -460,6 +465,11 @@ defmodule DefLayout.Scan do
 
   defp def_group_part?(_), do: false
 
+  # A delegate counts only with a call-shaped head: the deprecated list form
+  # (`defdelegate [a(x), b(y)], to: M`) has no single key, so it stays
+  # unrecognized and the module bails.
+  defp def_expr?({:defdelegate, _, [{name, _, _} | _]}) when is_atom(name), do: true
+  defp def_expr?({:defdelegate, _, _}), do: false
   defp def_expr?({kind, _, _}) when kind in @group_kinds, do: true
   defp def_expr?(_), do: false
 
