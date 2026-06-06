@@ -38,22 +38,33 @@ defmodule DefLayout.Scan do
         }
 
   # Slices a module body into ordered def_groups carrying their verbatim
-  # source-line span. Returns :error (the caller bails, leaving the module
-  # untouched) for anything it can't safely move: a non-function expression
-  # interleaved among the functions (nested modules bracketing them - above
-  # the first or below the last - are frozen tiers, not interleaved), a used
-  # macro/guard below the first function definition, non-adjacent
-  # duplicate-key clauses, or a header with an unrecognized module-level
-  # construct.
-  @spec def_groups([Macro.t()], pos_integer, [String.t()]) :: {:ok, [def_group]} | :error
+  # source-line span. Returns `{:error, reason}` (the caller bails, leaving the
+  # module untouched) for anything it can't safely move: a non-function
+  # expression interleaved among the functions (nested modules bracketing them
+  # - above the first or below the last - are frozen tiers, not interleaved), a
+  # used macro/guard below the first function definition, a nested module
+  # sitting among the functions, expansion-time code in a pinned macro that
+  # calls one of the module's functions, non-adjacent duplicate-key clauses,
+  # or a header with an unrecognized module-level construct. The reason atom
+  # names which bail fired (first one wins, via the short-circuiting
+  # with-chain); `Mix.Tasks.DefLayout.Skipped` maps it to a phrase.
+  @type bail_reason ::
+          :no_defs
+          | :interleaved_expression
+          | :nested_module
+          | :non_adjacent_clauses
+          | :unrecognized_header
+          | :used_macro_below_def
+          | :expansion_calls_function
+
+  @spec def_groups([Macro.t()], pos_integer, [String.t()]) ::
+          {:ok, [def_group]} | {:error, bail_reason}
   def def_groups(exprs, do_line, source_lines) do
     with {:ok, header, groups} <- partition(exprs),
-         true <- header_safe?(header),
+         :ok <- header_safe?(header),
          {:ok, pinned_keys} <- classify_pinned(header, groups) do
       header_stop = Enum.max([do_line | Enum.map(header, &max_line/1)])
       {:ok, materialize(header_stop, groups, pinned_keys, source_lines)}
-    else
-      _ -> :error
     end
   end
 
@@ -105,7 +116,7 @@ defmodule DefLayout.Scan do
           index > first_def_index and MapSet.member?(pinned_keys, key)
         end)
 
-      if pinned_below_first_def?, do: :error, else: {:ok, pinned_keys}
+      if pinned_below_first_def?, do: {:error, :used_macro_below_def}, else: {:ok, pinned_keys}
     end
   end
 
@@ -145,7 +156,7 @@ defmodule DefLayout.Scan do
         {:ok, pinned_keys}
 
       Enum.any?(expanded_pins, &(not MapSet.disjoint?(Enum.fetch!(group_exp, &1), def_names))) ->
-        :error
+        {:error, :expansion_calls_function}
 
       true ->
         {:ok, for({key, _exprs} = group <- groups, macro_group?(group), into: MapSet.new(), do: key)}
@@ -264,11 +275,28 @@ defmodule DefLayout.Scan do
 
     middle = Enum.reverse(middle)
 
-    if middle != [] and Enum.all?(middle, &def_group_part?/1) do
-      group_def_parts(middle, header)
-    else
-      :error
+    cond do
+      middle == [] ->
+        # No def-family expression anywhere: a declaration-only module body
+        # (a `@moduledoc` plus `use`/`@behaviour`/... ) has nothing to lay
+        # out, so it's vacuously conformant - distinct from a module whose
+        # functions are interleaved with a stray expression.
+        {:error, :no_defs}
+
+      Enum.all?(middle, &def_group_part?/1) ->
+        group_def_parts(middle, header)
+
+      true ->
+        {:error, interleaved_reason(middle)}
     end
+  end
+
+  # A nested module sitting among (not bracketing) the functions reads
+  # differently from a stray statement, so name it. Anything else - a reassigned
+  # attribute or a bare expression among the functions - is the generic
+  # interleaved case.
+  defp interleaved_reason(middle) do
+    if Enum.any?(middle, &nested_module?/1), do: :nested_module, else: :interleaved_expression
   end
 
   defp nested_module?({kind, _, _}) when kind in @nested_module_kinds, do: true
@@ -292,9 +320,13 @@ defmodule DefLayout.Scan do
         |> Enum.uniq()
         |> length()
 
-      if unique_key_count == length(groups), do: {:ok, header, groups}, else: :error
+      if unique_key_count == length(groups),
+        do: {:ok, header, groups},
+        else: {:error, :non_adjacent_clauses}
     else
-      :error
+      # A def-part with no def to attach to is left pending - a dangling
+      # attribute among the functions, the generic interleaved case.
+      {:error, :interleaved_expression}
     end
   end
 
@@ -315,7 +347,9 @@ defmodule DefLayout.Scan do
 
   # An unrecognized attribute hugging the first def would be stranded when that
   # def moves, so bail. (`@doc`/`@spec`/... attach to their def, never the header.)
-  defp header_safe?(header), do: Enum.all?(header, &allowed_header_expr?/1)
+  defp header_safe?(header) do
+    if Enum.all?(header, &allowed_header_expr?/1), do: :ok, else: {:error, :unrecognized_header}
+  end
 
   defp allowed_header_expr?({:@, _, [{name, _, _}]}), do: name in @header_attrs
   defp allowed_header_expr?({directive, _, _}) when directive in @header_directives, do: true
