@@ -20,6 +20,11 @@ defmodule DefLayout.Scan do
   # Recognized by name, like `def`/`import`: we assume standard Kernel semantics.
   # Shadowing these into def-attaching macros is out of scope (would strand silently).
   @header_macros [:defstruct, :defexception]
+  # A nested module bracketing the functions is an opaque, immovable anchor:
+  # frozen in source order, in the header above them or the trailer below
+  # them. Deliberately broader than the plugin's recursion list -
+  # `defprotocol` freezes in both tiers but is never recursed into.
+  @nested_module_kinds [:defmodule, :defimpl, :defprotocol]
 
   @type def_group :: %{
           key: {atom, non_neg_integer},
@@ -35,9 +40,11 @@ defmodule DefLayout.Scan do
   # Slices a module body into ordered def_groups carrying their verbatim
   # source-line span. Returns :error (the caller bails, leaving the module
   # untouched) for anything it can't safely move: a non-function expression
-  # interleaved among the functions, a used macro/guard below the first
-  # function definition, non-adjacent duplicate-key clauses, or a header with
-  # an unrecognized module-level construct.
+  # interleaved among the functions (nested modules bracketing them - above
+  # the first or below the last - are frozen tiers, not interleaved), a used
+  # macro/guard below the first function definition, non-adjacent
+  # duplicate-key clauses, or a header with an unrecognized module-level
+  # construct.
   @spec def_groups([Macro.t()], pos_integer, [String.t()]) :: {:ok, [def_group]} | :error
   def def_groups(exprs, do_line, source_lines) do
     with {:ok, header, groups} <- partition(exprs),
@@ -59,13 +66,16 @@ defmodule DefLayout.Scan do
   # edge-accurate call detection, where a scanner miss is a compile error
   # rather than a cosmetic miss, so bail instead.
   #
-  # Inert is decided by a conservative whole-module scan: the macro's name
-  # occurs nowhere outside its own group, and its own group references no
-  # in-module compile-time name. Every doubt - quote contents, variables or
-  # atom literals sharing the name - resolves to "used", so the failure
-  # direction is over-pinning, never a broken build. Private macros/guards
-  # never sort: an unused defmacrop/defguardp is a compiler warning, so in
-  # warnings-clean code they're always used.
+  # Inert is decided by a conservative scan of the header and the movable
+  # groups: the macro's name occurs nowhere in them outside its own group, and
+  # its own group references no in-module compile-time name. The trailer is
+  # not scanned - sound, because it sits below everything the engine moves, so
+  # a reference from there lands below the macro wherever it sorts. Every
+  # doubt - quote contents, variables or atom literals sharing the name -
+  # resolves to "used", so the failure direction is over-pinning, never a
+  # broken build. Private macros/guards never sort: an unused
+  # defmacrop/defguardp is a compiler warning, so in warnings-clean code
+  # they're always used.
   defp classify_pinned(header, groups) do
     group_refs = Enum.map(groups, fn {_key, exprs} -> referenced_names(exprs) end)
     header_refs = referenced_names(header)
@@ -236,18 +246,36 @@ defmodule DefLayout.Scan do
 
   defp exp_names(_other, _quoted?, acc), do: acc
 
+  # Header above the first def-family expr, the functions, then an optional
+  # trailer: the maximal trailing run of nested modules, frozen in place - the
+  # def region stops at the last function, so trailer lines are never touched.
+  # STRICT: any other trailing expr lands in the middle and fails the
+  # all-def-parts check, bailing the module. Trailer exprs are dropped here,
+  # which also keeps them out of the inert-macro analysis - sound, because the
+  # trailer sits below everything the engine moves, so even a genuine
+  # reference from there lands below the macro wherever it sorts.
   defp partition(exprs) do
     {header, rest} = Enum.split_while(exprs, &(not def_group_part?(&1)))
 
-    if rest != [] and Enum.all?(rest, &def_group_part?/1) do
-      group_def_parts(rest, header)
+    {_trailer, middle} =
+      rest
+      |> Enum.reverse()
+      |> Enum.split_while(&nested_module?/1)
+
+    middle = Enum.reverse(middle)
+
+    if middle != [] and Enum.all?(middle, &def_group_part?/1) do
+      group_def_parts(middle, header)
     else
       :error
     end
   end
 
-  defp group_def_parts(rest, header) do
-    {groups, pending} = Enum.reduce(rest, {[], []}, &group_def_part/2)
+  defp nested_module?({kind, _, _}) when kind in @nested_module_kinds, do: true
+  defp nested_module?(_), do: false
+
+  defp group_def_parts(middle, header) do
+    {groups, pending} = Enum.reduce(middle, {[], []}, &group_def_part/2)
 
     if pending == [] do
       groups =
@@ -292,6 +320,7 @@ defmodule DefLayout.Scan do
   defp allowed_header_expr?({:@, _, [{name, _, _}]}), do: name in @header_attrs
   defp allowed_header_expr?({directive, _, _}) when directive in @header_directives, do: true
   defp allowed_header_expr?({macro, _, _}) when macro in @header_macros, do: true
+  defp allowed_header_expr?({kind, _, _}) when kind in @nested_module_kinds, do: true
   defp allowed_header_expr?(_), do: false
 
   # Slices each group into a verbatim list of source lines, extending upward to

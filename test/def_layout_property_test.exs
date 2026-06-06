@@ -24,6 +24,13 @@ defmodule DefLayout.PropertyTest do
     end
   end
 
+  property "format(format(x)) == format(x) with nested modules" do
+    check all(source <- nested_module_gen()) do
+      once = format(source)
+      assert format(once) == once
+    end
+  end
+
   property "DefLayout + Quokka compose to a fixed point" do
     # The real dog-food pipeline is `plugins: [DefLayout, Quokka]`. A shared
     # explicit line_length keeps the two formatters from oscillating on width
@@ -44,12 +51,63 @@ defmodule DefLayout.PropertyTest do
   end
 
   defp module_gen do
+    gen all(body <- body_gen()) do
+      "defmodule M do\n" <> body <> "\nend\n"
+    end
+  end
+
+  # Scatters generated module bodies, wrapped as `defmodule`/`defimpl` blocks,
+  # among an outer module's own funs at random positions - facade, leading,
+  # trailing, and interleaved shapes all occur. Leading shapes join the outer's
+  # header and trailing shapes freeze in the trailer, so the outer lays out
+  # between them and inner + outer regions splice in one pass - the
+  # disjoint-splice-regions assert exercised in both directions; interleaved
+  # shapes bail the outer, locking inner bodies laying out inside an untouched
+  # one.
+  defp nested_module_gen do
+    inner_gen =
+      gen all(
+            wrapper <- member_of(["defmodule Inner do", "defimpl Proto, for: Target do"]),
+            body <- body_gen()
+          ) do
+        wrapper <> "\n" <> body <> "\nend"
+      end
+
+    gen all(
+          header <- header_gen(),
+          funs <- outer_funs_gen(),
+          inners <- list_of(inner_gen, min_length: 1, max_length: 2),
+          order <- fixed_list(Enum.map(funs ++ inners, fn _ -> integer() end))
+        ) do
+      items =
+        (funs ++ inners)
+        |> Enum.zip(order)
+        |> Enum.sort_by(&elem(&1, 1))
+        |> Enum.map(&elem(&1, 0))
+
+      "defmodule M do\n" <> Enum.join(header ++ items, "\n\n") <> "\nend\n"
+    end
+  end
+
+  defp body_gen do
     gen all(
           keys <- keys_gen(),
           specs <- fixed_list(Enum.map(keys, &spec_gen(&1, keys))),
           header <- header_gen()
         ) do
-      render(header, specs)
+      render_body(header, specs)
+    end
+  end
+
+  # The outer's own funs - possibly none, so pure-facade shapes occur.
+  defp outer_funs_gen do
+    gen all(
+          empty? <- boolean(),
+          keys <- keys_gen(),
+          specs <- fixed_list(Enum.map(keys, &spec_gen(&1, keys)))
+        ) do
+      by_key = Map.new(specs, &{&1.key, &1})
+      if empty?, do: [], else: Enum.map(specs, &render_fun(&1, by_key))
     end
   end
 
@@ -109,11 +167,9 @@ defmodule DefLayout.PropertyTest do
     end
   end
 
-  defp render(header, specs) do
+  defp render_body(header, specs) do
     by_key = Map.new(specs, &{&1.key, &1})
-    body = Enum.join(header ++ Enum.map(specs, &render_fun(&1, by_key)), "\n\n")
-
-    "defmodule M do\n" <> body <> "\nend\n"
+    Enum.join(header ++ Enum.map(specs, &render_fun(&1, by_key)), "\n\n")
   end
 
   defp render_fun(%{key: {name, arity}, kind: kind, callback?: callback?, calls: calls} = spec, by_key) do

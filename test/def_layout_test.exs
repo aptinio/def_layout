@@ -1131,11 +1131,12 @@ defmodule DefLayoutTest do
 
   # A public macro/guard the module provably never uses is position-free, so
   # it's just a public: it sorts by `{name, arity}`. Inert is decided by a
-  # conservative whole-module scan - its name occurs nowhere outside its own
-  # group, and its own group references no in-module compile-time name. Every
-  # doubt (quote contents, variables sharing the name, atom literals) resolves
-  # to "used" -> pinned, so the failure direction is over-pinning, never a
-  # define-before-use break.
+  # conservative scan of the header and the movable groups (the trailer is
+  # excluded - it sits below everything the engine moves): the name occurs
+  # nowhere in them outside its own group, and its own group references no
+  # in-module compile-time name. Every doubt (quote contents, variables
+  # sharing the name, atom literals) resolves to "used" - pinned - so the
+  # failure direction is over-pinning, never a define-before-use break.
   describe "inert macro sorting" do
     test "an inert macro between defs sorts with the publics" do
       source = """
@@ -3478,10 +3479,10 @@ defmodule DefLayoutTest do
       assert format(expected) == expected
     end
 
-    test "a nested module in the body bails (outer left untouched)" do
-      # A nested `defmodule` is an unrecognized construct sitting among the defs,
-      # so the outer module bails. The inner module isn't a top-level expr, so it
-      # isn't separately reordered either - the whole thing keeps source order.
+    test "a nested module in the body bails the outer (its own body still lays out)" do
+      # A nested `defmodule` interleaved among the defs (rather than bracketing
+      # them) bails the outer module, which keeps source order. Its body is a
+      # module body of its own, though, and gets the layout independently.
       source = """
       defmodule Outer do
         def beta, do: :b
@@ -3495,7 +3496,22 @@ defmodule DefLayoutTest do
       end
       """
 
-      assert format(source) == source
+      expected = """
+      defmodule Outer do
+        def beta, do: :b
+
+        defmodule Inner do
+          def x, do: :x
+
+          def y, do: :y
+        end
+
+        def alpha, do: :a
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
     end
 
     test "an unrecognized macro in the header bails" do
@@ -3534,6 +3550,1024 @@ defmodule DefLayoutTest do
       """
 
       assert format(source) == source
+    end
+  end
+
+  describe "nested modules" do
+    test "a facade module's nested module bodies each lay out" do
+      source = """
+      defmodule Outer do
+        defmodule One do
+          def beta, do: :b
+
+          def alpha, do: :a
+        end
+
+        defmodule Two do
+          def zeta, do: :z
+
+          def epsilon, do: :e
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defmodule One do
+          def alpha, do: :a
+
+          def beta, do: :b
+        end
+
+        defmodule Two do
+          def epsilon, do: :e
+
+          def zeta, do: :z
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a top-level defimpl body gets the layout: publics sort, privates sink" do
+      source = """
+      defimpl Render, for: Thing do
+        defp helper(t), do: t
+
+        def beta(t), do: helper(t)
+
+        def alpha(t), do: t
+      end
+      """
+
+      expected = """
+      defimpl Render, for: Thing do
+        def alpha(t), do: t
+
+        def beta(t), do: helper(t)
+
+        defp helper(t), do: t
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "@impl defs in a defimpl stay a callback tier in source order" do
+      source = """
+      defimpl Render, for: Thing do
+        def build(t), do: t
+
+        @impl true
+        def zeta(t), do: t
+
+        @impl true
+        def count(t), do: t
+      end
+      """
+
+      expected = """
+      defimpl Render, for: Thing do
+        @impl true
+        def zeta(t), do: t
+
+        @impl true
+        def count(t), do: t
+
+        def build(t), do: t
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defimpl for the defining struct lays out (outer bails)" do
+      # `defimpl Render do ... end` defaults `for:` to the enclosing module -
+      # the two-argument AST shape, no `for:` list among the args.
+      source = """
+      defmodule Thing do
+        defstruct [:name]
+
+        defimpl Render do
+          def beta(t), do: t.name
+
+          def alpha(t), do: t.name
+        end
+      end
+      """
+
+      expected = """
+      defmodule Thing do
+        defstruct [:name]
+
+        defimpl Render do
+          def alpha(t), do: t.name
+
+          def beta(t), do: t.name
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defimpl for a list of types lays out its single body" do
+      source = """
+      defimpl Render, for: [List, Map] do
+        def beta(x), do: x
+
+        def alpha(x), do: x
+      end
+      """
+
+      expected = """
+      defimpl Render, for: [List, Map] do
+        def alpha(x), do: x
+
+        def beta(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a nested module in a defimpl's header is frozen while the impl's defs sort" do
+      # A defimpl body is a plain module body, tiers included.
+      source = """
+      defimpl Render, for: Thing do
+        defmodule Helper do
+          def beta, do: :b
+
+          def alpha, do: :a
+        end
+
+        def zeta(t), do: t
+
+        def render(t), do: t
+      end
+      """
+
+      expected = """
+      defimpl Render, for: Thing do
+        defmodule Helper do
+          def alpha, do: :a
+
+          def beta, do: :b
+        end
+
+        def render(t), do: t
+
+        def zeta(t), do: t
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defprotocol body is never touched" do
+      source = """
+      defprotocol Render do
+        def beta(x)
+        def alpha(x)
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "nested module bodies lay out at every depth" do
+      source = """
+      defmodule Outer do
+        defmodule Mid do
+          defmodule Inner do
+            def beta, do: :b
+
+            def alpha, do: :a
+          end
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defmodule Mid do
+          defmodule Inner do
+            def alpha, do: :a
+
+            def beta, do: :b
+          end
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a keyword-form nested module bails (everything around it untouched)" do
+      # The parenthesized defimpls are the base formatter's fixed point for the
+      # keyword-call form under default opts; DefLayout adds no change to them.
+      # The do-less ones parse (they only fail at compile), so the walk shrugs
+      # them off rather than crashing.
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        defmodule Inner, do: :x
+
+        def alpha, do: :a
+      end
+
+      defimpl(Render, for: Thing, do: :ok)
+
+      defimpl(Render, for: OtherThing)
+
+      defimpl(Render)
+      """
+
+      assert format(source) == source
+    end
+
+    test "a keyword-form module's nested module bodies still lay out" do
+      # The keyword form bails per node - only its own layout has nothing to
+      # splice against; the walk still descends, so a regular nested module
+      # inside one lays out.
+      source = """
+      defmodule Outer,
+        do:
+          (defmodule Inner do
+             def beta, do: :b
+             def alpha, do: :a
+           end)
+      """
+
+      expected = """
+      defmodule Outer,
+        do:
+          (defmodule Inner do
+             def alpha, do: :a
+
+             def beta, do: :b
+           end)
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a keyword-form defimpl's nested module bodies still lay out" do
+      # The keyword form of defimpl merges `for:` and `do:` into one trailing
+      # option list - the descent fetches `:do` from wherever it sits.
+      source = """
+      defimpl(KWRender,
+        for: KWThing,
+        do:
+          (
+            defmodule Helper do
+              def beta, do: :b
+              def alpha, do: :a
+            end
+
+            def render(t), do: t
+          )
+      )
+      """
+
+      expected = """
+      defimpl(KWRender,
+        for: KWThing,
+        do:
+          (
+            defmodule Helper do
+              def alpha, do: :a
+
+              def beta, do: :b
+            end
+
+            def render(t), do: t
+          )
+      )
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defmodule inside a def body rides with its def" do
+      # The walk descends through module-body positions only: a module defined
+      # inside a function body is part of that function's text, so it rides
+      # along on the def's move and its own body is left alone.
+      source = """
+      defmodule Outer do
+        def beta do
+          defmodule Inner do
+            def y, do: :y
+            def x, do: :x
+          end
+        end
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def alpha, do: :a
+
+        def beta do
+          defmodule Inner do
+            def y, do: :y
+            def x, do: :x
+          end
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a nested module above the defs is frozen in the header while the defs sort" do
+      source = """
+      defmodule Outer do
+        defmodule Inner do
+          def go, do: :ok
+        end
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defmodule Inner do
+          def go, do: :ok
+        end
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a header nested module's body and the outer's defs lay out in one pass" do
+      # The shape where the disjoint-splice-regions assert goes load-bearing:
+      # the inner's region sits inside the frozen header, strictly above the
+      # outer's def region, and both splice in the same pass.
+      source = """
+      defmodule Outer do
+        @moduledoc false
+
+        defmodule Inner do
+          def y, do: :y
+
+          def x, do: :x
+        end
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        @moduledoc false
+
+        defmodule Inner do
+          def x, do: :x
+
+          def y, do: :y
+        end
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "two header nested modules' bodies and the outer's defs lay out in one pass" do
+      # Three disjoint regions in one splice: each frozen header module keeps
+      # its (deliberately non-alphabetical) position while its body lays out.
+      source = """
+      defmodule Outer do
+        defmodule Inner2 do
+          def y, do: :y
+
+          def x, do: :x
+        end
+
+        defmodule Inner1 do
+          def b, do: :b
+
+          def a, do: :a
+        end
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defmodule Inner2 do
+          def x, do: :x
+
+          def y, do: :y
+        end
+
+        defmodule Inner1 do
+          def a, do: :a
+
+          def b, do: :b
+        end
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defimpl above the defs is frozen in the header while the defs sort" do
+      source = """
+      defmodule Outer do
+        defstruct [:name]
+
+        defimpl Render do
+          def render(t), do: t.name
+        end
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defstruct [:name]
+
+        defimpl Render do
+          def render(t), do: t.name
+        end
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defprotocol above the defs is frozen in the header while the defs sort" do
+      source = """
+      defmodule Outer do
+        defprotocol Marker do
+          def beta(x)
+          def alpha(x)
+        end
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defprotocol Marker do
+          def beta(x)
+          def alpha(x)
+        end
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a keyword-form nested module above the defs is frozen in the header" do
+      # Header exprs are never spliced, so the missing `:do` line that bails
+      # keyword-form modules elsewhere doesn't matter here.
+      source = """
+      defmodule Outer do
+        defmodule Inner, do: :x
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defmodule Inner, do: :x
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a nested module below a pinned macro bails (its own body still lays out)" do
+      # The header tier ends at the first def*-family expr, pinned macros
+      # included - a nested module below one is interleaved, so the outer
+      # keeps source order.
+      source = """
+      defmodule Outer do
+        defmacrop mac(x), do: x
+
+        defmodule Inner do
+          def y, do: :y
+
+          def x, do: :x
+        end
+
+        def beta, do: mac(:b)
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defmacrop mac(x), do: x
+
+        defmodule Inner do
+          def x, do: :x
+
+          def y, do: :y
+        end
+
+        def beta, do: mac(:b)
+
+        def alpha, do: :a
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a macro referenced from a header nested module's body pins" do
+      # Header nested modules feed the inert-macro analysis like any other
+      # header expr: `:zmac` inside Inner's body counts as a reference, so
+      # `zmac` pins (stays first, source order) instead of sorting below beta.
+      source = """
+      defmodule Outer do
+        defmodule Inner do
+          def tag, do: :zmac
+        end
+
+        defmacro zmac(x), do: x
+
+        def beta, do: :b
+
+        def alpha, do: :a
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defmodule Inner do
+          def tag, do: :zmac
+        end
+
+        defmacro zmac(x), do: x
+
+        def alpha, do: :a
+
+        def beta, do: :b
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a nested module below the defs is frozen in the trailer while the defs sort" do
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule Inner do
+          def go, do: :ok
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmodule Inner do
+          def go, do: :ok
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defimpl below the defs is frozen in the trailer while the defs sort" do
+      source = """
+      defmodule Thing do
+        defstruct [:name]
+
+        def beta(t), do: t
+
+        def alpha(t), do: t
+
+        defimpl Render do
+          def render(t), do: t.name
+        end
+      end
+      """
+
+      expected = """
+      defmodule Thing do
+        defstruct [:name]
+
+        def alpha(t), do: t
+
+        def beta(t), do: t
+
+        defimpl Render do
+          def render(t), do: t.name
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a defprotocol below the defs is frozen in the trailer while the defs sort" do
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defprotocol Marker do
+          def beta(x)
+          def alpha(x)
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defprotocol Marker do
+          def beta(x)
+          def alpha(x)
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a keyword-form nested module below the defs is frozen in the trailer" do
+      # Trailer exprs are never spliced, so the missing `:do` line that bails
+      # keyword-form modules elsewhere doesn't matter here either.
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule Inner, do: :x
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmodule Inner, do: :x
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a run of trailing nested modules is frozen in source order" do
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule Zed do
+          def go, do: :ok
+        end
+
+        defimpl Render, for: Ant do
+          def render(t), do: t
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmodule Zed do
+          def go, do: :ok
+        end
+
+        defimpl Render, for: Ant do
+          def render(t), do: t
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a trailing nested module's body and the outer's defs lay out in one pass" do
+      # The disjoint-splice-regions assert in the direction the header shape
+      # can't produce: the outer's def region sits strictly ABOVE the trailing
+      # module's inner region, and both splice in the same pass.
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule Inner do
+          def y, do: :y
+
+          def x, do: :x
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmodule Inner do
+          def x, do: :x
+
+          def y, do: :y
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "defs sort between a header nested module and a trailing one" do
+      # The straddle shape: both frozen tiers present, the def region lays out
+      # between them.
+      source = """
+      defmodule Outer do
+        defmodule Above do
+          def go, do: :ok
+        end
+
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule Below do
+          def stop, do: :ok
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        defmodule Above do
+          def go, do: :ok
+        end
+
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmodule Below do
+          def stop, do: :ok
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a comment between the last def and the trailer stays put" do
+      # The def region stops at the last function, so the comment below it
+      # never rides along with a moving def.
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        # implementations live below
+
+        defmodule Inner do
+          def go, do: :ok
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        # implementations live below
+
+        defmodule Inner do
+          def go, do: :ok
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a trailing non-module expression bails the outer (nested bodies still lay out)" do
+      # Passes before A2 too (the bail path also leaves the outer untouched) -
+      # a deliberate boundary guard against over-recognition: the trailer is
+      # STRICTLY the maximal run of nested modules at the very end, so any
+      # other expression below the defs keeps the whole module in source order.
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule Inner do
+          def y, do: :y
+
+          def x, do: :x
+        end
+
+        IO.puts("loaded")
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule Inner do
+          def x, do: :x
+
+          def y, do: :y
+        end
+
+        IO.puts("loaded")
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a def between trailing nested modules bails the outer (nested bodies still lay out)" do
+      # Also passes before A2 - the same boundary guard: a def below a nested
+      # module makes that module interleaved, not trailing, even when another
+      # nested module closes the file.
+      source = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule One do
+          def y, do: :y
+
+          def x, do: :x
+        end
+
+        def gamma, do: :g
+
+        defmodule Two do
+          def go, do: :ok
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule One do
+          def x, do: :x
+
+          def y, do: :y
+        end
+
+        def gamma, do: :g
+
+        defmodule Two do
+          def go, do: :ok
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a macro referenced only from a trailing module's body still sorts" do
+      # Mirror of the header `:zmac` test, opposite outcome: trailer bodies
+      # deliberately do NOT feed the inert-macro analysis. The trailer sits
+      # below everything the engine moves, so even a genuine reference from
+      # there lands below the macro wherever it sorts - constraint-free.
+      source = """
+      defmodule Outer do
+        defmacro zmac(x), do: x
+
+        def beta, do: :b
+
+        def alpha, do: :a
+
+        defmodule Inner do
+          def tag, do: :zmac
+        end
+      end
+      """
+
+      expected = """
+      defmodule Outer do
+        def alpha, do: :a
+
+        def beta, do: :b
+
+        defmacro zmac(x), do: x
+
+        defmodule Inner do
+          def tag, do: :zmac
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
     end
   end
 end

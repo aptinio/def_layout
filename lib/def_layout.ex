@@ -37,15 +37,17 @@ defmodule DefLayout do
     |> then(&IO.iodata_to_binary([&1, ?\n]))
   end
 
+  @module_kinds [:defmodule, :defimpl]
+
   # Collects a line-span replacement for each module that needs reordering, then
   # splices them into the source bottom-up (so earlier line numbers stay valid).
   defp reorder(source, ast) do
     source_lines = String.split(source, "\n")
 
     ast
-    |> top_level_exprs()
-    |> Enum.flat_map(&replacement(&1, source_lines))
+    |> replacements(source_lines)
     |> Enum.sort_by(fn {region_start, _region_stop, _region_lines} -> region_start end, :desc)
+    |> assert_disjoint()
     |> Enum.reduce(source_lines, fn {region_start, region_stop, region_lines}, acc ->
       {pre, rest} = Enum.split(acc, region_start - 1)
       {_replaced_region, post} = Enum.split(rest, region_stop - region_start + 1)
@@ -54,26 +56,64 @@ defmodule DefLayout do
     |> Enum.join("\n")
   end
 
-  defp top_level_exprs({:__block__, _, exprs}) when is_list(exprs), do: exprs
-  defp top_level_exprs(expr), do: [expr]
+  # Distinct modules' regions never overlap - a nested module's region lies
+  # strictly inside lines its outer never moves - and the bottom-up splice
+  # silently corrupts if that ever breaks, so assert it rather than assume it.
+  defp assert_disjoint(replacements) do
+    replacements
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.each(fn [{upper_start, _, _}, {_, lower_stop, _}] ->
+      true = lower_stop < upper_start
+    end)
 
-  defp replacement({:defmodule, meta, [_, [{:do, body}]]}, source_lines) do
+    replacements
+  end
+
+  # Collects replacements from every module-shaped expr in a block - the file's
+  # top level or a module body.
+  defp replacements(block, source_lines) do
+    block
+    |> block_exprs()
+    |> Enum.flat_map(&module_replacements(&1, source_lines))
+  end
+
+  defp block_exprs({:__block__, _, exprs}) when is_list(exprs), do: exprs
+  defp block_exprs(expr), do: [expr]
+
+  # A `defmodule`/`defimpl` yields its own replacement plus, recursively, those
+  # of the module-shaped exprs in its body - regardless of whether it bails
+  # itself, so e.g. a facade's nested modules still lay out. A defimpl body is
+  # a plain module body; `defprotocol` bodies are signature defs, never
+  # entered. The walk descends through module-body positions only: a
+  # `defmodule` inside a def body rides with its def.
+  #
+  # `do_line` anchors the header span; a keyword-form module (`defmodule M,
+  # do: ...`) carries no `:do` line metadata, so its own layout has nothing
+  # to splice against and bails - but only per node: the walk still descends,
+  # since nested modules carry their own anchors. The descent fetches `:do`
+  # from the trailing option list, which the keyword form of defimpl shares
+  # with `for:`.
+  defp module_replacements({kind, meta, args}, source_lines) when kind in @module_kinds and is_list(args) do
     do_line = meta[:do][:line]
 
-    # `do_line` anchors the header span; a keyword-form `defmodule M, do: ...`
-    # carries no `:do` line metadata, so there's nothing to splice against - bail.
-    case body do
-      {:__block__, _, exprs} when is_list(exprs) and is_integer(do_line) ->
-        module_replacement(exprs, do_line, source_lines)
+    case List.last(args) do
+      [{:do, {:__block__, _, exprs} = body}] when is_list(exprs) and is_integer(do_line) ->
+        own_replacement(exprs, do_line, source_lines) ++ replacements(body, source_lines)
+
+      [_ | _] = opts ->
+        case List.keyfind(opts, :do, 0) do
+          {:do, body} -> replacements(body, source_lines)
+          nil -> []
+        end
 
       _ ->
         []
     end
   end
 
-  defp replacement(_expr, _source_lines), do: []
+  defp module_replacements(_expr, _source_lines), do: []
 
-  defp module_replacement(exprs, do_line, source_lines) do
+  defp own_replacement(exprs, do_line, source_lines) do
     with {:ok, def_groups} <- Scan.def_groups(exprs, do_line, source_lines),
          ordered = Engine.order(def_groups),
          true <- Enum.map(def_groups, & &1.key) != Enum.map(ordered, & &1.key) do
