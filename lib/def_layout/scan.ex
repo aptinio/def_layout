@@ -5,17 +5,10 @@ defmodule DefLayout.Scan do
   @delegate_kinds [:defdelegate]
   @macro_kinds [:defmacro, :defmacrop, :defguard, :defguardp]
   @group_kinds @def_kinds ++ @macro_kinds
+  @def_family_kinds @group_kinds ++ @delegate_kinds
   @attaching_attrs [:doc, :spec, :impl, :deprecated, :dialyzer]
   @attaching_macros [:attr, :slot]
 
-  # Module-level constructs allowed to sit in the header above the functions.
-  # Anything else in the header -> bail (see `header_safe?/1`).
-  @header_attrs [:moduledoc] ++
-                  [:behaviour, :behavior] ++
-                  [:type, :typep, :opaque, :callback, :macrocallback, :optional_callbacks] ++
-                  [:derive, :enforce_keys] ++
-                  [:compile, :before_compile, :after_compile, :after_verify, :on_load] ++
-                  [:vsn, :external_resource]
   @header_directives [:use, :import, :alias, :require]
   # Recognized by name, like `def`/`import`: we assume standard Kernel semantics.
   # Shadowing these into def-attaching macros is out of scope (would strand silently).
@@ -66,6 +59,213 @@ defmodule DefLayout.Scan do
       header_stop = Enum.max([do_line | Enum.map(header, &max_line/1)])
       {:ok, materialize(header_stop, groups, pinned_keys, source_lines)}
     end
+  end
+
+  # Header above the first def-family expr, the functions, then an optional
+  # trailer: the maximal trailing run of nested modules, frozen in place - the
+  # def region stops at the last function, so trailer lines are never touched.
+  # STRICT: any other trailing expr lands in the middle and fails the
+  # all-def-parts check, bailing the module. Trailer exprs are dropped here,
+  # which also keeps them out of the inert-macro analysis - sound, because the
+  # trailer sits below everything the engine moves, so even a genuine
+  # reference from there lands below the macro wherever it sorts.
+  defp partition(exprs) do
+    {header, rest} = header_split(exprs)
+
+    {_trailer, middle} =
+      rest
+      |> Enum.reverse()
+      |> Enum.split_while(&nested_module?/1)
+
+    middle = Enum.reverse(middle)
+
+    cond do
+      middle == [] ->
+        # No own def-family expression remains after peeling the header and
+        # the trailing nested-module run: a declaration-only body (a
+        # `@moduledoc` plus `use`/`@behaviour`/...) or a facade of only nested
+        # modules has nothing of its own to lay out, so it's vacuously
+        # conformant - distinct from a module whose functions are interleaved
+        # with a stray expression.
+        {:error, :no_defs}
+
+      Enum.all?(middle, &def_group_part?/1) ->
+        group_def_parts(middle, header)
+
+      true ->
+        {:error, interleaved_reason(middle)}
+    end
+  end
+
+  # Peels the header off the front. Plain non-def-parts split as before. The one
+  # subtlety: a maximal run of attaching attrs (`@doc`/`@spec`) terminated by a
+  # `@callback`/`@macrocallback` documents that callback declaration - it is
+  # module-level setup, not a def's leading block - so the whole run stays in
+  # the header rather than peeling the first `@doc` into the def region. A run
+  # terminated by a def (or anything else) stays the def's attachment, exactly as
+  # before. The callback-documenting shape only counts while still in the header;
+  # the same pair below the first def is genuinely interleaved and still bails.
+  defp header_split(exprs) do
+    {plain, rest} = Enum.split_while(exprs, &(not def_group_part?(&1)))
+
+    case documented_callback_run(rest) do
+      {attrs, cb, after_run} ->
+        {tail_header, middle} = header_split(after_run)
+        {Enum.concat([plain, attrs, [cb | tail_header]]), middle}
+
+      :none ->
+        {plain, rest}
+    end
+  end
+
+  defp def_group_part?({:defdelegate, _, _} = expr), do: def_expr?(expr)
+  defp def_group_part?({kind, _, _}) when kind in @group_kinds, do: true
+  defp def_group_part?({:@, _, [{name, _, _}]}) when name in @attaching_attrs, do: true
+
+  defp def_group_part?({macro, _, args}) when macro in @attaching_macros and is_list(args), do: true
+
+  defp def_group_part?(_), do: false
+
+  defp group_def_parts(middle, header) do
+    {groups, pending} = Enum.reduce(middle, {[], []}, &group_def_part/2)
+
+    if pending == [] do
+      groups =
+        groups
+        |> Enum.reverse()
+        |> Enum.map(fn {key, exprs} -> {key, Enum.reverse(exprs)} end)
+
+      # The reduce merges only *adjacent* same-key clauses into one def_group, so
+      # non-adjacent clauses of one function leave duplicate keys; bail rather
+      # than reorder a shape the scanner didn't model.
+      unique_key_count =
+        groups
+        |> Enum.map(&elem(&1, 0))
+        |> Enum.uniq()
+        |> length()
+
+      if unique_key_count == length(groups),
+        do: {:ok, header, groups},
+        else: {:error, :non_adjacent_clauses}
+    else
+      # A def-part with no def to attach to is left pending - a dangling
+      # attribute among the functions, the generic interleaved case.
+      {:error, :interleaved_expression}
+    end
+  end
+
+  # `pending` holds a function's leading attrs until its `def` arrives; same-key
+  # clauses then merge into one group, so multi-clause functions stay together.
+  defp group_def_part(expr, {groups, pending}) do
+    if def_expr?(expr) do
+      key = key_of(expr)
+
+      case groups do
+        [{^key, exprs} | rest] -> {[{key, [expr | pending] ++ exprs} | rest], []}
+        _ -> {[{key, [expr | pending]} | groups], []}
+      end
+    else
+      {groups, [expr | pending]}
+    end
+  end
+
+  defp key_of({_kind, _, [head | _]}), do: head_name_arity(head)
+
+  defp head_name_arity({:when, _, [inner | _]}), do: head_name_arity(inner)
+  defp head_name_arity({name, _, args}) when is_atom(name), do: {name, arity_of(args)}
+
+  defp arity_of(args) when is_list(args), do: length(args)
+  defp arity_of(_), do: 0
+
+  # A nested module sitting among (not bracketing) the functions reads
+  # differently from a stray statement, so name it. Anything else - a reassigned
+  # attribute or a bare expression among the functions - is the generic
+  # interleaved case.
+  defp interleaved_reason(middle) do
+    if Enum.any?(middle, &nested_module?/1), do: :nested_module, else: :interleaved_expression
+  end
+
+  defp nested_module?({kind, _, _}) when kind in @nested_module_kinds, do: true
+  defp nested_module?(_), do: false
+
+  # An unrecognized attribute hugging the first def would be stranded when that
+  # def moves, so bail. (`@doc`/`@spec`/... attach to their def, never the
+  # header - the lone exception is a `@doc`/`@spec` run terminated by a
+  # `@callback`/`@macrocallback`, which `partition` already recognized as
+  # documentation of that callback and left in the header; consume those runs
+  # here so their attaching attrs don't read as stray.)
+  defp header_safe?([]), do: :ok
+
+  defp header_safe?(header) do
+    case documented_callback_run(header) do
+      {_attrs, _cb, rest} -> header_safe?(rest)
+      :none -> header_safe_expr?(header)
+    end
+  end
+
+  # A maximal leading run of attaching attrs (`attrs`) terminated by a callback
+  # attr (`cb`), with the exprs after it; `:none` if `exprs` does not start with
+  # such a run.
+  defp documented_callback_run(exprs) do
+    case Enum.split_while(exprs, &attaching_attr?/1) do
+      {[_ | _] = attrs, [{:@, _, [{name, _, _}]} = cb | after_cb]}
+      when name in [:callback, :macrocallback] ->
+        {attrs, cb, after_cb}
+
+      _ ->
+        :none
+    end
+  end
+
+  defp attaching_attr?({:@, _, [{name, _, _}]}), do: name in [:doc, :spec]
+  defp attaching_attr?(_), do: false
+
+  defp header_safe_expr?([expr | rest]) do
+    if allowed_header_expr?(expr), do: header_safe?(rest), else: {:error, :unrecognized_header}
+  end
+
+  # A plain value attribute (`@version "0.1.0"`, `@timeout 5_000`) is module
+  # setup like the named ones: the header never moves, so every def sits below
+  # it before and after reorder and reads the same value at definition time.
+  # Attaching attrs are excluded - they're peeled into their def's group by
+  # `def_group_part?`, and the only ones that reach the header (a `@doc`/`@spec`
+  # run documenting a `@callback`) are consumed by `header_safe?` before this
+  # check - so admitting the rest can't swallow an attachment. `@on_definition`
+  # is the one order-sensitive compile
+  # callback: it fires per def in definition order and can consume per-def
+  # attrs (`@tag`), which a reorder would strand - so it must keep bailing. A
+  # macro call in the value pins via `classify_pinned`.
+  defp allowed_header_expr?({:@, _, [{name, _, _}]}), do: name not in @attaching_attrs and name != :on_definition
+
+  defp allowed_header_expr?({directive, _, _}) when directive in @header_directives, do: true
+  defp allowed_header_expr?({macro, _, _}) when macro in @header_macros, do: true
+  defp allowed_header_expr?({kind, _, _}) when kind in @nested_module_kinds, do: true
+  # A module-body match (`path = compute()`, `{a, b} = ...`) binds a var that is
+  # unreachable from any def body (def bodies have their own scope), and the RHS
+  # evaluates once at compile in source order. The header never moves, so it is
+  # the same safety class as a value attribute. The lone hazard is a `def` hidden
+  # in the RHS (`_ = def hidden(), do: :ok` compiles): that would freeze a def
+  # invisibly in the header, so bail when the RHS syntactically contains a
+  # def-family form - the bare `def foo` shape or a qualified `Kernel.def foo`
+  # call, which parses to a dotted head but still defines. The RHS names pin
+  # in-module macros via `referenced_names`, the same way a value attribute's do.
+  defp allowed_header_expr?({:=, _, [_lhs, rhs]}), do: not contains_def_family?(rhs)
+  defp allowed_header_expr?(_), do: false
+
+  defp contains_def_family?(ast) do
+    {_node, found?} =
+      Macro.prewalk(ast, false, fn
+        {kind, _, _} = node, _acc when kind in @def_family_kinds ->
+          {node, true}
+
+        {{:., _, [_target, kind]}, _, _} = node, _acc when kind in @def_family_kinds ->
+          {node, true}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    found?
   end
 
   # Compile-time definitions (macros/guards) are define-before-use, so their
@@ -120,6 +320,38 @@ defmodule DefLayout.Scan do
     end
   end
 
+  # Every atom the AST mentions - call heads, bare names and variables,
+  # literal atoms, quote contents. Nameless invocation forms need no special
+  # handling: a non-quoted in-module use/import/require of the module itself
+  # is a compile error ("currently being defined", so `__using__`'s position
+  # is never load-bearing here), `@before_compile __MODULE__` and
+  # `@on_definition __MODULE__` are compile errors for the same reason, and
+  # `@after_compile`/`@after_verify` self-hooks target plain functions, whose
+  # position is free. All verified empirically.
+  defp referenced_names(ast) do
+    {_node, names} =
+      Macro.prewalk(ast, MapSet.new(), fn
+        {name, _, _} = node, acc when is_atom(name) ->
+          {node, MapSet.put(acc, name)}
+
+        node, acc when is_atom(node) ->
+          {node, MapSet.put(acc, node)}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    names
+  end
+
+  defp inert?(name, index, {header_refs, group_refs}, macro_names) do
+    own_refs = Enum.fetch!(group_refs, index)
+    other_refs = List.delete_at(group_refs, index)
+
+    not Enum.any?([header_refs | other_refs], &(name in &1)) and
+      MapSet.disjoint?(own_refs, MapSet.delete(macro_names, name))
+  end
+
   # A pinned defmacro referenced in an expansion-time position runs during
   # this module's compile, and an expansion is arbitrary code the syntactic
   # scan can't see into. Two consequences, both closed here: the expansion
@@ -163,40 +395,6 @@ defmodule DefLayout.Scan do
     end
   end
 
-  defp inert?(name, index, {header_refs, group_refs}, macro_names) do
-    own_refs = Enum.fetch!(group_refs, index)
-    other_refs = List.delete_at(group_refs, index)
-
-    not Enum.any?([header_refs | other_refs], &(name in &1)) and
-      MapSet.disjoint?(own_refs, MapSet.delete(macro_names, name))
-  end
-
-  defp macro_group?({_key, exprs}), do: def_kind_of(exprs) in @macro_kinds
-
-  # Every atom the AST mentions - call heads, bare names and variables,
-  # literal atoms, quote contents. Nameless invocation forms need no special
-  # handling: a non-quoted in-module use/import/require of the module itself
-  # is a compile error ("currently being defined", so `__using__`'s position
-  # is never load-bearing here), `@before_compile __MODULE__` and
-  # `@on_definition __MODULE__` are compile errors for the same reason, and
-  # `@after_compile`/`@after_verify` self-hooks target plain functions, whose
-  # position is free. All verified empirically.
-  defp referenced_names(ast) do
-    {_node, names} =
-      Macro.prewalk(ast, MapSet.new(), fn
-        {name, _, _} = node, acc when is_atom(name) ->
-          {node, MapSet.put(acc, name)}
-
-        node, acc when is_atom(node) ->
-          {node, MapSet.put(acc, node)}
-
-        node, acc ->
-          {node, acc}
-      end)
-
-    names
-  end
-
   # Call-shaped names evaluated when this code runs at macro expansion:
   # everything outside `quote`, plus `unquote`/`unquote_splicing` fragments
   # and a quote's opts (`bind_quoted:` values) within one. Code that's merely
@@ -210,20 +408,6 @@ defmodule DefLayout.Scan do
       Enum.reduce(body, acc, &exp_names(&1, false, &2))
     end)
   end
-
-  # A head contributes its guard and its default-argument expressions - a
-  # macro in either expands when the def compiles (verified: `x \\ mac()`
-  # errors at definition when `mac` isn't defined yet). The defining call
-  # isn't a use of its own name, and argument patterns aren't expansion-time
-  # code.
-  defp head_expansion_terms({:when, _, [call | guards]}), do: guards ++ argument_defaults(call)
-  defp head_expansion_terms(head), do: argument_defaults(head)
-
-  defp argument_defaults({_name, _, args}) when is_list(args) do
-    for {:\\, _, [_pattern, default]} <- args, do: default
-  end
-
-  defp argument_defaults(_head), do: []
 
   defp exp_names({:quote, _, args}, false, acc) when is_list(args) do
     Enum.reduce(args, acc, fn
@@ -257,105 +441,15 @@ defmodule DefLayout.Scan do
 
   defp exp_names(_other, _quoted?, acc), do: acc
 
-  # Header above the first def-family expr, the functions, then an optional
-  # trailer: the maximal trailing run of nested modules, frozen in place - the
-  # def region stops at the last function, so trailer lines are never touched.
-  # STRICT: any other trailing expr lands in the middle and fails the
-  # all-def-parts check, bailing the module. Trailer exprs are dropped here,
-  # which also keeps them out of the inert-macro analysis - sound, because the
-  # trailer sits below everything the engine moves, so even a genuine
-  # reference from there lands below the macro wherever it sorts.
-  defp partition(exprs) do
-    {header, rest} = Enum.split_while(exprs, &(not def_group_part?(&1)))
+  # A head contributes its guard and its default-argument expressions - a
+  # macro in either expands when the def compiles (verified: `x \\ mac()`
+  # errors at definition when `mac` isn't defined yet). The defining call
+  # isn't a use of its own name, and argument patterns aren't expansion-time
+  # code.
+  defp head_expansion_terms({:when, _, [call | guards]}), do: guards ++ argument_defaults(call)
+  defp head_expansion_terms(head), do: argument_defaults(head)
 
-    {_trailer, middle} =
-      rest
-      |> Enum.reverse()
-      |> Enum.split_while(&nested_module?/1)
-
-    middle = Enum.reverse(middle)
-
-    cond do
-      middle == [] ->
-        # No def-family expression anywhere: a declaration-only module body
-        # (a `@moduledoc` plus `use`/`@behaviour`/... ) has nothing to lay
-        # out, so it's vacuously conformant - distinct from a module whose
-        # functions are interleaved with a stray expression.
-        {:error, :no_defs}
-
-      Enum.all?(middle, &def_group_part?/1) ->
-        group_def_parts(middle, header)
-
-      true ->
-        {:error, interleaved_reason(middle)}
-    end
-  end
-
-  # A nested module sitting among (not bracketing) the functions reads
-  # differently from a stray statement, so name it. Anything else - a reassigned
-  # attribute or a bare expression among the functions - is the generic
-  # interleaved case.
-  defp interleaved_reason(middle) do
-    if Enum.any?(middle, &nested_module?/1), do: :nested_module, else: :interleaved_expression
-  end
-
-  defp nested_module?({kind, _, _}) when kind in @nested_module_kinds, do: true
-  defp nested_module?(_), do: false
-
-  defp group_def_parts(middle, header) do
-    {groups, pending} = Enum.reduce(middle, {[], []}, &group_def_part/2)
-
-    if pending == [] do
-      groups =
-        groups
-        |> Enum.reverse()
-        |> Enum.map(fn {key, exprs} -> {key, Enum.reverse(exprs)} end)
-
-      # The reduce merges only *adjacent* same-key clauses into one def_group, so
-      # non-adjacent clauses of one function leave duplicate keys; bail rather
-      # than reorder a shape the scanner didn't model.
-      unique_key_count =
-        groups
-        |> Enum.map(&elem(&1, 0))
-        |> Enum.uniq()
-        |> length()
-
-      if unique_key_count == length(groups),
-        do: {:ok, header, groups},
-        else: {:error, :non_adjacent_clauses}
-    else
-      # A def-part with no def to attach to is left pending - a dangling
-      # attribute among the functions, the generic interleaved case.
-      {:error, :interleaved_expression}
-    end
-  end
-
-  # `pending` holds a function's leading attrs until its `def` arrives; same-key
-  # clauses then merge into one group, so multi-clause functions stay together.
-  defp group_def_part(expr, {groups, pending}) do
-    if def_expr?(expr) do
-      key = key_of(expr)
-
-      case groups do
-        [{^key, exprs} | rest] -> {[{key, [expr | pending] ++ exprs} | rest], []}
-        _ -> {[{key, [expr | pending]} | groups], []}
-      end
-    else
-      {groups, [expr | pending]}
-    end
-  end
-
-  # An unrecognized attribute hugging the first def would be stranded when that
-  # def moves, so bail. (`@doc`/`@spec`/... attach to their def, never the header.)
-  defp header_safe?(header) do
-    if Enum.all?(header, &allowed_header_expr?/1), do: :ok, else: {:error, :unrecognized_header}
-  end
-
-  defp allowed_header_expr?({:@, _, [{name, _, _}]}), do: name in @header_attrs
-  defp allowed_header_expr?({directive, _, _}) when directive in @header_directives, do: true
-  defp allowed_header_expr?({macro, _, _}) when macro in @header_macros, do: true
-  defp allowed_header_expr?({kind, _, _}) when kind in @nested_module_kinds, do: true
-  defp allowed_header_expr?(_), do: false
+  defp macro_group?({_key, exprs}), do: def_kind_of(exprs) in @macro_kinds
 
   # Slices each group into a verbatim list of source lines, extending upward to
   # capture leading comments. The gap above a group (between it and the previous
@@ -394,6 +488,47 @@ defmodule DefLayout.Scan do
       end)
 
     Enum.reverse(def_groups)
+  end
+
+  # A head with defaults defines every arity from full-minus-defaults to full.
+  defp arity_ranges(groups) do
+    for {{name, arity} = key, exprs} <- groups do
+      {name, arity - max_default_count(exprs), arity, key}
+    end
+  end
+
+  defp max_default_count(exprs) do
+    exprs
+    |> Enum.filter(&def_expr?/1)
+    |> Enum.map(fn {_kind, _, [head | _]} ->
+      head
+      |> head_call()
+      |> argument_defaults()
+      |> length()
+    end)
+    |> Enum.max()
+  end
+
+  defp meta_line({_, meta, _}), do: Keyword.fetch!(meta, :line)
+
+  # Largest source line a node touches: its own `:line` plus the `:line` of any
+  # nested metadata block (`:end`, `:closing`, `:do`, ... - handled generically).
+  defp max_line(root_node) do
+    {_node, max} =
+      Macro.prewalk(root_node, 0, fn
+        {_, meta, _} = node, acc when is_list(meta) -> {node, max(acc, meta_max_line(meta))}
+        node, acc -> {node, acc}
+      end)
+
+    max
+  end
+
+  defp meta_max_line(meta) do
+    Enum.reduce(meta, 0, fn
+      {:line, line}, acc when is_integer(line) -> max(acc, line)
+      {_key, nested_meta}, acc when is_list(nested_meta) -> max(acc, nested_meta[:line] || 0)
+      {_key, _value}, acc -> acc
+    end)
   end
 
   # First non-blank line in the gap is the topmost leading comment; the group
@@ -446,49 +581,20 @@ defmodule DefLayout.Scan do
     |> Enum.uniq()
   end
 
+  # A delegate counts only with a call-shaped head: the deprecated list form
+  # (`defdelegate [a(x), b(y)], to: M`) has no single key, so it stays
+  # unrecognized. Alone it is a no-def body; sitting among movable defs it
+  # reads as interleaved and the module bails.
+  defp def_expr?({:defdelegate, _, [{name, _, _} | _]}) when is_atom(name), do: true
+  defp def_expr?({:defdelegate, _, _}), do: false
+  defp def_expr?({kind, _, _}) when kind in @group_kinds, do: true
+  defp def_expr?(_), do: false
+
   defp default_calls(head) do
     head
     |> head_call()
     |> argument_defaults()
     |> collect_calls()
-  end
-
-  # A head with defaults defines every arity from full-minus-defaults to full.
-  defp arity_ranges(groups) do
-    for {{name, arity} = key, exprs} <- groups do
-      {name, arity - max_default_count(exprs), arity, key}
-    end
-  end
-
-  defp max_default_count(exprs) do
-    exprs
-    |> Enum.filter(&def_expr?/1)
-    |> Enum.map(fn {_kind, _, [head | _]} ->
-      head
-      |> head_call()
-      |> argument_defaults()
-      |> length()
-    end)
-    |> Enum.max()
-  end
-
-  defp head_call({:when, _, [call | _]}), do: call
-  defp head_call(head), do: head
-
-  # A call inside a group's arity range resolves to that group's key. Among
-  # overlapping ranges (a defaults conflict the compiler rejects anyway) the
-  # lowest full arity wins - the exact-arity group when one exists - keeping
-  # the choice independent of source order, which keeps reordering idempotent.
-  defp resolve_call({name, arity} = call, ranges) do
-    case for({^name, min, max, key} <- ranges, arity >= min, arity <= max, do: {max, key}) do
-      [] ->
-        call
-
-      candidates ->
-        candidates
-        |> Enum.min()
-        |> elem(1)
-    end
   end
 
   defp collect_calls(ast) do
@@ -520,49 +626,28 @@ defmodule DefLayout.Scan do
 
   defp unpipe(node), do: node
 
-  defp def_group_part?({:defdelegate, _, _} = expr), do: def_expr?(expr)
-  defp def_group_part?({kind, _, _}) when kind in @group_kinds, do: true
-  defp def_group_part?({:@, _, [{name, _, _}]}) when name in @attaching_attrs, do: true
-
-  defp def_group_part?({macro, _, args}) when macro in @attaching_macros and is_list(args), do: true
-
-  defp def_group_part?(_), do: false
-
-  # A delegate counts only with a call-shaped head: the deprecated list form
-  # (`defdelegate [a(x), b(y)], to: M`) has no single key, so it stays
-  # unrecognized and the module bails.
-  defp def_expr?({:defdelegate, _, [{name, _, _} | _]}) when is_atom(name), do: true
-  defp def_expr?({:defdelegate, _, _}), do: false
-  defp def_expr?({kind, _, _}) when kind in @group_kinds, do: true
-  defp def_expr?(_), do: false
-
-  defp key_of({_kind, _, [head | _]}), do: head_name_arity(head)
-
-  defp head_name_arity({:when, _, [inner | _]}), do: head_name_arity(inner)
-  defp head_name_arity({name, _, args}) when is_atom(name), do: {name, arity_of(args)}
-
-  defp arity_of(args) when is_list(args), do: length(args)
-  defp arity_of(_), do: 0
-
-  defp meta_line({_, meta, _}), do: Keyword.fetch!(meta, :line)
-
-  # Largest source line a node touches: its own `:line` plus the `:line` of any
-  # nested metadata block (`:end`, `:closing`, `:do`, ... - handled generically).
-  defp max_line(root_node) do
-    {_node, max} =
-      Macro.prewalk(root_node, 0, fn
-        {_, meta, _} = node, acc when is_list(meta) -> {node, max(acc, meta_max_line(meta))}
-        node, acc -> {node, acc}
-      end)
-
-    max
+  defp argument_defaults({_name, _, args}) when is_list(args) do
+    for {:\\, _, [_pattern, default]} <- args, do: default
   end
 
-  defp meta_max_line(meta) do
-    Enum.reduce(meta, 0, fn
-      {:line, line}, acc when is_integer(line) -> max(acc, line)
-      {_key, nested_meta}, acc when is_list(nested_meta) -> max(acc, nested_meta[:line] || 0)
-      {_key, _value}, acc -> acc
-    end)
+  defp argument_defaults(_head), do: []
+
+  defp head_call({:when, _, [call | _]}), do: call
+  defp head_call(head), do: head
+
+  # A call inside a group's arity range resolves to that group's key. Among
+  # overlapping ranges (a defaults conflict the compiler rejects anyway) the
+  # lowest full arity wins - the exact-arity group when one exists - keeping
+  # the choice independent of source order, which keeps reordering idempotent.
+  defp resolve_call({name, arity} = call, ranges) do
+    case for({^name, min, max, key} <- ranges, arity >= min, arity <= max, do: {max, key}) do
+      [] ->
+        call
+
+      candidates ->
+        candidates
+        |> Enum.min()
+        |> elem(1)
+    end
   end
 end

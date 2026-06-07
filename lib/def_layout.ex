@@ -6,6 +6,8 @@ defmodule DefLayout do
   alias DefLayout.Engine
   alias DefLayout.Scan
 
+  @module_kinds [:defmodule, :defimpl]
+
   @impl Mix.Tasks.Format
   def features(_opts), do: [extensions: [".ex", ".exs"]]
 
@@ -36,8 +38,6 @@ defmodule DefLayout do
     |> Code.format_string!(opts)
     |> then(&IO.iodata_to_binary([&1, ?\n]))
   end
-
-  @module_kinds [:defmodule, :defimpl]
 
   # Collects a line-span replacement for each module that needs reordering, then
   # splices them into the source bottom-up (so earlier line numbers stay valid).

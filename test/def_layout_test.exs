@@ -3333,7 +3333,7 @@ defmodule DefLayoutTest do
       assert format(source) == expected
     end
 
-    test "an unrecognized module attribute in the header bails (no stranding)" do
+    test "a plain value attribute in the header still reorders" do
       source = """
       defmodule M do
         @timeout 5_000
@@ -3348,7 +3348,172 @@ defmodule DefLayoutTest do
       end
       """
 
+      expected = """
+      defmodule M do
+        @timeout 5_000
+
+        def alpha do
+          :alpha
+        end
+
+        def beta do
+          @timeout
+        end
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "an accumulating attribute assigned twice in the header still reorders" do
+      source = """
+      defmodule M do
+        @steps :one
+        @steps :two
+
+        def beta, do: :beta
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @steps :one
+        @steps :two
+
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a plain value attribute interleaved after the first def still bails" do
+      # A value attribute is header-safe, but only as a *header* statement. A
+      # def reads attributes at its definition position, so moving one across a
+      # mid-module assignment would change the value it compiles with - bail.
+      source = """
+      defmodule M do
+        def beta do
+          :beta
+        end
+
+        @timeout 5_000
+
+        def alpha do
+          @timeout
+        end
+      end
+      """
+
       assert format(source) == source
+    end
+
+    test "an @on_definition hook in the header bails (order-sensitive callback)" do
+      # `@on_definition` fires per def in definition order and can consume
+      # per-def attributes, so reordering defs would change what it sees. It is
+      # not a header-safe value attribute - the module must bail.
+      source = """
+      defmodule M do
+        @on_definition {SomeModule, :handle}
+        @timeout 5_000
+
+        def beta do
+          :beta
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "an @on_definition hook never strands a per-def attribute it consumes" do
+      # The classic strand shape: `@tag :beta` sits directly above `beta` for
+      # the hook to read at beta's definition. Reordering would move `alpha`
+      # above the tag and let the hook tag the wrong def. The header bail covers
+      # it; lock the never-strand shape explicitly.
+      source = """
+      defmodule M do
+        @on_definition {SomeModule, :handle}
+
+        @tag :beta
+        def beta do
+          :beta
+        end
+
+        def alpha do
+          :alpha
+        end
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a header attribute referencing an in-module macro keeps it pinned" do
+      # The header attribute mentions the macro's name (`:limit`), so the macro
+      # is no longer provably inert: it pins via the `header_refs` path in
+      # `classify_pinned` and stays at the top, rather than sorting down among
+      # the publics the way an unreferenced inert macro would.
+      source = """
+      defmodule M do
+        @names [:limit]
+
+        defmacro limit, do: 5
+
+        def beta, do: :beta
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @names [:limit]
+
+        defmacro limit, do: 5
+
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "an attachment attribute above the first def attaches to it, not the header" do
+      # `@doc`/`@spec` are def-attaching, never header constructs: the leading
+      # `@doc` rides with `beta` as it moves below `alpha`, rather than being
+      # absorbed into the header and stranded.
+      source = """
+      defmodule M do
+        @doc "beta docs"
+        def beta, do: :beta
+
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha, do: :alpha
+
+        @doc "beta docs"
+        def beta, do: :beta
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
     end
 
     test "module-level compile hooks in the header still reorder" do
@@ -3546,6 +3711,311 @@ defmodule DefLayoutTest do
         def alpha do
           :alpha
         end
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a @doc documenting a header @callback stays frozen while publics sort" do
+      # `@doc` is def-attaching, but a `@doc` run terminated by `@callback`
+      # documents the callback declaration - module-level setup, not the start
+      # of the def region. The whole block stays frozen in the header; only the
+      # publics below it reorder. (The plausible `Cache` shape, minus `__using__`.)
+      source = """
+      defmodule M do
+        @moduledoc "M"
+
+        @doc "the name callback"
+        @callback name() :: atom()
+
+        @doc "the count callback"
+        @callback count() :: integer()
+
+        def beta, do: :beta
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @moduledoc "M"
+
+        @doc "the name callback"
+        @callback name() :: atom()
+
+        @doc "the count callback"
+        @callback count() :: integer()
+
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a @doc/@spec/@callback chain in the header stays frozen while publics sort" do
+      # A `@doc` then `@spec` then `@callback` run compiles and documents the
+      # callback - the recognition rule allows the whole attaching-attr chain,
+      # not just a bare `@doc` adjacency.
+      source = """
+      defmodule M do
+        @doc "init the thing"
+        @spec init(term) :: term
+        @callback init(term) :: term
+
+        def beta, do: :beta
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @doc "init the thing"
+        @spec init(term) :: term
+        @callback init(term) :: term
+
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a bare @callback block in the header still reorders" do
+      # Regression guard: a `@callback` run with no leading `@doc` was already
+      # header-legal and must stay so.
+      source = """
+      defmodule M do
+        @callback name() :: atom()
+        @callback count() :: integer()
+
+        def beta, do: :beta
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        @callback name() :: atom()
+        @callback count() :: integer()
+
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a @doc/@callback pair below the first def still bails" do
+      # The recognition rule applies only while still in the header. The same
+      # shape sitting among the defs is genuinely interleaved and must bail.
+      source = """
+      defmodule M do
+        def beta, do: :beta
+
+        @doc "the name callback"
+        @callback name() :: atom()
+
+        def alpha, do: :alpha
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a dangling @doc with no def or callback after it still bails" do
+      # A `@doc` run terminated by neither a def nor a `@callback` (here, the
+      # module ends) leaves the `@doc` pending with nothing to attach to - the
+      # generic interleaved/unrecognized case, still a bail.
+      source = """
+      defmodule M do
+        def beta, do: :beta
+        def alpha, do: :alpha
+
+        @doc "trailing, attaches to nothing"
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a header match assignment above the defs still reorders" do
+      # A module-body `=` binds a var unreachable from any def body and stays
+      # frozen in the header. It is module-level setup like a value attribute,
+      # so the publics below it sort while it stays put.
+      source = """
+      defmodule M do
+        base = [:a, :b, :c]
+        @names base
+
+        def beta, do: @names
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        base = [:a, :b, :c]
+        @names base
+
+        def alpha, do: :alpha
+
+        def beta, do: @names
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a header write-buffer match assignment reorders and is a fixed point" do
+      # The write-buffer idiom: a `=` computes a value the header then feeds to
+      # an attribute (and a directive). The assignment, its consumers, and the
+      # defs all sit in source order; only the defs sort.
+      source = """
+      defmodule M do
+        path = "priv/data.js"
+        @external_resource path
+        @data path
+
+        def beta, do: @data
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        path = "priv/data.js"
+        @external_resource path
+        @data path
+
+        def alpha, do: :alpha
+
+        def beta, do: @data
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a header match destructuring a tuple still reorders" do
+      source = """
+      defmodule M do
+        {a, b} = {:x, :y}
+        @pair {a, b}
+
+        def beta, do: @pair
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        {a, b} = {:x, :y}
+        @pair {a, b}
+
+        def alpha, do: :alpha
+
+        def beta, do: @pair
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a match assignment interleaved after the first def still bails" do
+      # A `=` is header-safe only as a header statement. Once it sits among the
+      # defs, moving a function across it could change what the compiler sees,
+      # so the module must bail.
+      source = """
+      defmodule M do
+        def beta, do: :beta
+
+        x = compute()
+        @cached x
+
+        def alpha, do: :alpha
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a header match whose RHS mentions an in-module macro keeps it pinned" do
+      # The match RHS mentions the macro's name (`:limit`), so the macro is no
+      # longer provably inert: it pins via the `header_refs` path (the existing
+      # `referenced_names` prewalk walks the match node) and stays at the top,
+      # rather than sorting down among the publics.
+      source = """
+      defmodule M do
+        names = [:limit]
+        @names names
+
+        defmacro limit, do: 5
+
+        def beta, do: :beta
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        names = [:limit]
+        @names names
+
+        defmacro limit, do: 5
+
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a def hidden in a header match RHS bails" do
+      # `_ = def hidden(), do: :ok` compiles and defines `hidden`, but it is a
+      # `:=` node, not a def-part, so admitting matches would freeze the def
+      # invisibly in the header. The RHS-contains-a-def guard bails instead.
+      source = """
+      defmodule M do
+        _ = def hidden(), do: :ok
+
+        def visible, do: hidden()
+        def another, do: :another
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a qualified def hidden in a header match RHS bails" do
+      # `Kernel.defmacro hidden(), ...` parses as a dotted call, not a bare
+      # `{:defmacro, _, _}` node, but it still defines a macro and compiles. If
+      # admitted, the macro freezes in the header invisible to the engine, and
+      # reordering a function its expansion calls below the expansion site
+      # breaks the build. The guard must catch the qualified form too.
+      source = """
+      defmodule M do
+        _ = Kernel.defmacro(hidden(), do: helper())
+
+        def helper, do: quote(do: :ok)
+        def beta, do: hidden()
+        def alpha, do: :alpha
       end
       """
 

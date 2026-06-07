@@ -44,7 +44,20 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
     test "a module with an unrecognized header construct IS skipped (case a - header bail)" do
       source = """
       defmodule M do
-        @timeout 5_000
+        plug(:authenticate)
+        def beta, do: 2
+        def alpha, do: 1
+      end
+      """
+
+      assert skipped(source) ==
+               [{"lib/example.ex", 1, "M", "an unrecognized construct above the first def"}]
+    end
+
+    test "a module with an @on_definition header hook IS skipped (order-sensitive callback)" do
+      source = """
+      defmodule M do
+        @on_definition {SomeModule, :handle}
         def beta, do: 2
         def alpha, do: 1
       end
@@ -216,7 +229,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
     test "the outer module is skipped while an inner lays out" do
       source = """
       defmodule Outer do
-        @timeout 1
+        plug(:authenticate)
         defmodule Inner do
           def b, do: 2
           def a, do: 1
@@ -234,7 +247,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
     test "a defimpl block is labelled with its protocol and target" do
       source = """
       defimpl String.Chars, for: MyType do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
@@ -249,7 +262,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
     test "a defimpl without an explicit for: keeps just the protocol name" do
       source = """
       defimpl Inspect do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
@@ -262,7 +275,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
     test "a __MODULE__-named module is labelled __MODULE__" do
       source = """
       defimpl Inspect, for: __MODULE__ do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
@@ -277,7 +290,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
     test "a dynamically-named module falls back to its source text" do
       source = """
       defmodule Module.concat([Foo, Bar]) do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
@@ -292,7 +305,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
     test "both outer and inner can be skipped, reported in source order" do
       source = """
       defmodule Outer do
-        @timeout 1
+        plug(:authenticate)
         defmodule Inner do
           def b, do: 2
           @y 1
@@ -355,7 +368,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
     test "sibling top-level modules each report independently" do
       source = """
       defmodule A do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
@@ -387,7 +400,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
 
       File.write!(skip_path, """
       defmodule Skip do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
@@ -418,7 +431,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
 
       File.write!(skip_path, """
       defmodule Skip do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
@@ -456,7 +469,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
 
       File.write!(skip, """
       defmodule Skip do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
@@ -484,7 +497,7 @@ defmodule Mix.Tasks.DefLayout.SkippedTest do
 
       File.write!(skip, """
       defmodule Skip do
-        @x 1
+        plug(:authenticate)
         def b, do: 2
         def a, do: 1
       end
