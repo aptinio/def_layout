@@ -446,10 +446,13 @@ defmodule DefLayoutTest do
       assert DefLayout.features([]) == [extensions: [".ex", ".exs"]]
     end
 
-    test "source that fails to parse is returned unchanged" do
-      source = "defmodule M do"
-
-      assert format(source) == source
+    test "source that fails to parse raises, like the base formatter" do
+      # DefLayout replaces the default formatter for .ex/.exs, so on unparseable
+      # input it must fail the same way `mix format` does rather than passing it
+      # through silently - otherwise `mix format --check-formatted` would stop
+      # catching syntax errors.
+      assert_raise TokenMissingError, fn -> format("defmodule M do") end
+      assert_raise MismatchedDelimiterError, fn -> format("defmodule M do\n  def a(\nend") end
     end
 
     test "reorders inside a module while leaving sibling top-level code untouched" do

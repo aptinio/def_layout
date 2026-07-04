@@ -19,18 +19,17 @@ defmodule DefLayout do
     # to reach the fixed point. Splicing relies on the same normalization -
     # formatted text never leaves two defs (or a def and the header) sharing
     # a line, so def_group line-spans are disjoint.
-    case Code.string_to_quoted(source) do
-      {:ok, _ast} ->
-        formatted = format_string(source, opts)
-        {:ok, ast} = Code.string_to_quoted(formatted, token_metadata: true)
+    #
+    # This also raises on unparseable input exactly as the base formatter does:
+    # a plugin replaces the default formatter for its extensions, so swallowing
+    # a syntax error here would let `mix format --check-formatted` pass a broken
+    # file. The formatted text is guaranteed to parse, so the reparse is strict.
+    formatted = format_string(source, opts)
+    {:ok, ast} = Code.string_to_quoted(formatted, token_metadata: true)
 
-        formatted
-        |> reorder(ast)
-        |> format_string(opts)
-
-      {:error, _} ->
-        source
-    end
+    formatted
+    |> reorder(ast)
+    |> format_string(opts)
   end
 
   defp format_string(source, opts) do
