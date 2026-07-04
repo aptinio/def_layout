@@ -2277,6 +2277,130 @@ defmodule DefLayoutTest do
 
       assert format(source) == source
     end
+
+    test "a def with an unquote-fragment head bails rather than crashing" do
+      # `def unquote(name)()` is legal, compiling Elixir but its head is not a
+      # plain atom, so there is no `{name, arity}` key to sort by. The scanner
+      # must bail (leave the module in source order), not crash on the head.
+      source = """
+      defmodule M do
+        name = :hello
+        def unquote(name)(), do: :world
+
+        def alpha, do: :ok
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a def with a remote-call head bails rather than crashing" do
+      # `def Foo.bar()` parses (the base formatter handles it; it is rejected
+      # only at compile time). A non-atom head has no local key, so the module
+      # bails instead of crashing when it sits among movable defs.
+      source = """
+      defmodule M do
+        def alpha, do: 1
+        def Foo.bar(), do: 2
+        def zed, do: 3
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a defmacro with an unquote-fragment head bails rather than crashing" do
+      source = """
+      defmodule M do
+        which = :gen
+
+        defmacro unquote(which)(x) do
+          quote(do: unquote(x))
+        end
+
+        def alpha, do: :ok
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a bare def token with no head bails rather than crashing" do
+      # `def` alone parses (to `{:def, _, nil}`) though it never compiles. With
+      # no head there is no key, so it is not a movable def part and the module
+      # bails instead of crashing on the missing head.
+      source = """
+      defmodule M do
+        def alpha, do: 1
+        def
+        def zed, do: 2
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a def with a parenless unquote head bails rather than reordering" do
+      # `def unquote(:hello)` parses to a head whose name *is* the atom
+      # `:unquote` - a special form standing in for a computed name, not a real
+      # function called `unquote`. It has no stable `{name, arity}` key, so the
+      # module must bail rather than sort it as if it were named `unquote`.
+      source = """
+      defmodule M do
+        def unquote(:hello), do: :world
+        def alpha, do: :ok
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a def with an unquote_splicing head bails rather than reordering" do
+      source = """
+      defmodule M do
+        def unquote_splicing([:hello]), do: :world
+        def alpha, do: :ok
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a defguard with a parenless unquote head bails rather than reordering" do
+      source = """
+      defmodule M do
+        defguard unquote(:hello) when true
+        def alpha, do: :ok
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a defdelegate with a parenless unquote head bails rather than reordering" do
+      source = """
+      defmodule M do
+        defdelegate unquote(:hello), to: String
+        def alpha, do: :ok
+      end
+      """
+
+      assert format(source) == source
+    end
+
+    test "a bare defdelegate token with no head bails rather than crashing" do
+      # Like a bare `def`, `defdelegate` alone parses (to `{:defdelegate, _,
+      # nil}`) without a head to key on, so it is not a movable def part and the
+      # module bails.
+      source = """
+      defmodule M do
+        defdelegate
+        def a, do: 1
+      end
+      """
+
+      assert format(source) == source
+    end
   end
 
   describe "private placement" do

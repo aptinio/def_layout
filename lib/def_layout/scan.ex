@@ -119,7 +119,7 @@ defmodule DefLayout.Scan do
   end
 
   defp def_group_part?({:defdelegate, _, _} = expr), do: def_expr?(expr)
-  defp def_group_part?({kind, _, _}) when kind in @group_kinds, do: true
+  defp def_group_part?({kind, _, _} = expr) when kind in @group_kinds, do: def_expr?(expr)
   defp def_group_part?({:@, _, [{name, _, _}]}) when name in @attaching_attrs, do: true
 
   defp def_group_part?({macro, _, args}) when macro in @attaching_macros and is_list(args), do: true
@@ -170,12 +170,6 @@ defmodule DefLayout.Scan do
   end
 
   defp key_of({_kind, _, [head | _]}), do: head_name_arity(head)
-
-  defp head_name_arity({:when, _, [inner | _]}), do: head_name_arity(inner)
-  defp head_name_arity({name, _, args}) when is_atom(name), do: {name, arity_of(args)}
-
-  defp arity_of(args) when is_list(args), do: length(args)
-  defp arity_of(_), do: 0
 
   # A nested module sitting among (not bracketing) the functions reads
   # differently from a stray statement, so name it. Anything else - a reassigned
@@ -581,14 +575,29 @@ defmodule DefLayout.Scan do
     |> Enum.uniq()
   end
 
-  # A delegate counts only with a call-shaped head: the deprecated list form
-  # (`defdelegate [a(x), b(y)], to: M`) has no single key, so it stays
-  # unrecognized. Alone it is a no-def body; sitting among movable defs it
-  # reads as interleaved and the module bails.
-  defp def_expr?({:defdelegate, _, [{name, _, _} | _]}) when is_atom(name), do: true
+  # A movable def is one `head_name_arity` can key. The deprecated list-form
+  # delegate (`defdelegate [a(x), b(y)], to: M`) has a list head, so it keys to
+  # nil: alone it is a no-def body, and among movable defs it reads as
+  # interleaved and the module bails.
+  defp def_expr?({:defdelegate, _, [head | _]}), do: head_name_arity(head) != nil
   defp def_expr?({:defdelegate, _, _}), do: false
-  defp def_expr?({kind, _, _}) when kind in @group_kinds, do: true
+  defp def_expr?({kind, _, [head | _]}) when kind in @group_kinds, do: head_name_arity(head) != nil
+  defp def_expr?({kind, _, _}) when kind in @group_kinds, do: false
   defp def_expr?(_), do: false
+
+  # The `{name, arity}` sort key of a function head, or nil when the head has no
+  # knowable stable name: a remote head (`def Foo.bar()`), a bare `def`, or an
+  # `unquote`/`unquote_splicing` fragment. The parenless `def unquote(:hello)`
+  # is the trap - its head *is* the atom-named `{:unquote, _, _}`, but that atom
+  # stands in for a name computed at expansion, so reject it rather than key it
+  # as `unquote`. `def_expr?` reads a nil key as "not a movable def".
+  defp head_name_arity({:when, _, [inner | _]}), do: head_name_arity(inner)
+  defp head_name_arity({name, _, _}) when name in [:unquote, :unquote_splicing], do: nil
+  defp head_name_arity({name, _, args}) when is_atom(name), do: {name, arity_of(args)}
+  defp head_name_arity(_), do: nil
+
+  defp arity_of(args) when is_list(args), do: length(args)
+  defp arity_of(_), do: 0
 
   defp default_calls(head) do
     head
