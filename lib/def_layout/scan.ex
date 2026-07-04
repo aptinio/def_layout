@@ -446,24 +446,32 @@ defmodule DefLayout.Scan do
   defp macro_group?({_key, exprs}), do: def_kind_of(exprs) in @macro_kinds
 
   # Slices each group into a verbatim list of source lines, extending upward to
-  # capture leading comments. The gap above a group (between it and the previous
-  # group, or the header) belongs to it from its first comment line down, so
-  # free-floating comments ride along rather than being dropped.
+  # capture leading comments and downward to capture a trailing comment block.
+  # The gap above a group belongs to it from its first comment line down, so
+  # free-floating comments ride along rather than being dropped; the gap below
+  # (up to the next group) splits into this group's trailing block and the next
+  # group's leading block, matching the base formatter's blank-line ownership.
   defp materialize(header_stop, groups, pinned_keys, source_lines) do
     ranges = arity_ranges(groups)
 
+    spans =
+      Enum.map(groups, fn {_key, exprs} ->
+        {meta_line(hd(exprs)), max_line(List.last(exprs))}
+      end)
+
+    # Trailing stop needs the next group's first line, so fold from the bottom
+    # up: each step's `next_first` is the group below.
+    {stops, _next_first} =
+      spans
+      |> Enum.reverse()
+      |> Enum.reduce({[], nil}, fn {first_expr_line, def_stop}, {acc, next_first} ->
+        {[trailing_stop(source_lines, def_stop, next_first) | acc], first_expr_line}
+      end)
+
     {def_groups, _prev_stop} =
-      Enum.reduce(groups, {[], header_stop}, fn {key, exprs}, {acc, prev_stop} ->
-        first_expr_line =
-          exprs
-          |> hd()
-          |> meta_line()
-
-        group_stop =
-          exprs
-          |> List.last()
-          |> max_line()
-
+      [groups, spans, stops]
+      |> Enum.zip()
+      |> Enum.reduce({[], header_stop}, fn {{key, exprs}, {first_expr_line, _def_stop}, group_stop}, {acc, prev_stop} ->
         group_start = lead_start(source_lines, prev_stop + 1, first_expr_line)
         lines = Enum.slice(source_lines, (group_start - 1)..(group_stop - 1)//1)
 
@@ -523,6 +531,25 @@ defmodule DefLayout.Scan do
       {_key, nested_meta}, acc when is_list(nested_meta) -> max(acc, nested_meta[:line] || 0)
       {_key, _value}, acc -> acc
     end)
+  end
+
+  # Extends a group's span past its own last line to swallow a trailing comment
+  # block: a run of comment lines directly below the def (no blank between) that
+  # is closed by a blank line before the next group. The base formatter keeps
+  # such a comment with the code above it (a blank line separates a comment from
+  # the code below), so it must ride with this def, not the next. A run flush
+  # against the next def (no closing blank) is that def's leading block and is
+  # left behind; and the last group (`next_first` is nil) never trails, since
+  # anything below it lies outside the region the engine moves.
+  defp trailing_stop(_source_lines, def_stop, nil), do: def_stop
+
+  defp trailing_stop(source_lines, def_stop, next_first) do
+    run_stop =
+      Enum.reduce_while((def_stop + 1)..(next_first - 1)//1, def_stop, fn line, last ->
+        if non_blank_line?(source_lines, line), do: {:cont, line}, else: {:halt, last}
+      end)
+
+    if run_stop > def_stop and run_stop < next_first - 1, do: run_stop, else: def_stop
   end
 
   # First non-blank line in the gap is the topmost leading comment; the group

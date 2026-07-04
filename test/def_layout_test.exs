@@ -313,6 +313,58 @@ defmodule DefLayoutTest do
       assert format(expected) == expected
     end
 
+    test "a comment hugging a def's bottom rides with that def, not the next" do
+      # The base formatter groups a comment with the code it is not separated
+      # from by a blank line: this note is adjacent below `beta` with a blank
+      # after it, so it trails `beta`. When `alpha` sorts above, the note stays
+      # with `beta` rather than re-homing onto `alpha`.
+      source = """
+      defmodule M do
+        def beta, do: :beta
+        # note about beta
+
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+        # note about beta
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
+    test "a multi-line comment block hugging a def's bottom rides with that def" do
+      source = """
+      defmodule M do
+        def beta, do: :beta
+        # note one
+        # note two
+
+        def alpha, do: :alpha
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def alpha, do: :alpha
+
+        def beta, do: :beta
+        # note one
+        # note two
+      end
+      """
+
+      assert format(source) == expected
+      assert format(expected) == expected
+    end
+
     test "a trailing inline comment stays with its own def, never cross-attributed" do
       # The base formatter lifts each trailing comment to a leading line before
       # layout, so the comment rides in its def's span. (The lift is
