@@ -158,7 +158,7 @@ Add `def_layout` to your dependencies:
 # mix.exs
 defp deps do
   [
-    {:def_layout, "~> 0.1.0", only: [:dev, :test], runtime: false}
+    {:def_layout, "~> 0.1.1", only: [:dev, :test], runtime: false}
   ]
 end
 ```
