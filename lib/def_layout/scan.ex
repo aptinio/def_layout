@@ -654,10 +654,12 @@ defmodule DefLayout.Scan do
   end
 
   # `lhs |> f(a)` calls `f/2`, not `f/1`: the piped value is f's first argument.
-  # Rewrite each local pipe into the plain call so the collector sees the real
-  # arity. Remote targets (name is a `.`-tuple, not an atom) are left untouched.
+  # Rewrite each local pipe stage so the collector sees the real arity, with a
+  # placeholder standing in for the piped value. `lhs` stays ahead of the call
+  # rather than nesting inside it, so stages collect in reading order. Remote
+  # targets (name is a `.`-tuple, not an atom) are left untouched.
   defp unpipe({:|>, _, [lhs, {name, meta, args}]}) when is_atom(name) and (is_list(args) or is_nil(args)) do
-    {name, meta, [lhs | List.wrap(args)]}
+    [lhs, {name, meta, [:piped | List.wrap(args)]}]
   end
 
   defp unpipe(node), do: node

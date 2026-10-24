@@ -2835,6 +2835,91 @@ defmodule DefLayoutTest do
       assert format(source) == expected
     end
 
+    test "co-anchored privates follow a pipe's reading order" do
+      source = """
+      defmodule M do
+        def caller(x) do
+          x |> first() |> second()
+        end
+
+        defp second(x) do
+          x
+        end
+
+        defp first(x) do
+          x
+        end
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def caller(x) do
+          x |> first() |> second()
+        end
+
+        defp first(x) do
+          x
+        end
+
+        defp second(x) do
+          x
+        end
+      end
+      """
+
+      assert format(source) == expected
+    end
+
+    test "pipe reading order holds across remote stages, captures and nested pipes" do
+      source = """
+      defmodule M do
+        def caller(x) do
+          x
+          |> first()
+          |> Enum.map(&second/1)
+          |> third(x |> fourth() |> fifth())
+          |> String.trim()
+          |> sixth()
+        end
+
+        defp sixth(x), do: x
+        defp fifth(x), do: x
+        defp fourth(x), do: x
+        defp third(x, _y), do: x
+        defp second(x), do: x
+        defp first(x), do: x
+      end
+      """
+
+      expected = """
+      defmodule M do
+        def caller(x) do
+          x
+          |> first()
+          |> Enum.map(&second/1)
+          |> third(x |> fourth() |> fifth())
+          |> String.trim()
+          |> sixth()
+        end
+
+        defp first(x), do: x
+
+        defp second(x), do: x
+
+        defp third(x, _y), do: x
+
+        defp fourth(x), do: x
+
+        defp fifth(x), do: x
+
+        defp sixth(x), do: x
+      end
+      """
+
+      assert format(source) == expected
+    end
+
     test "a private referenced only by capture anchors below the capturing caller" do
       source = """
       defmodule M do
