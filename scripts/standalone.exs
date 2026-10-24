@@ -19,7 +19,8 @@
 #                     the reordered output must compile too. This is what
 #                     catches a reorder that moves a use below its definition;
 #                     the line-based checks can't see it. Files that don't
-#                     compile on their own (they import deps this VM lacks) are
+#                     compile on their own (they import deps this VM lacks), or
+#                     that define the VM's own modules (Elixir's source), are
 #                     gated out and counted as skipped, not failed.
 #
 # Pass: each corpus prints a one-line summary with FAILURES=0 and the script
@@ -103,6 +104,43 @@ defmodule Check do
 
   def macro_module?(s), do: Regex.match?(~r/^\s*(defmacro|defmacrop|defguard|defguardp)[\s(]/m, s)
 
+  # Compiling a module this VM already has replaces it in place. The sweep runs
+  # on Elixir, Mix and DefLayout, so a corpus that defines any of their modules
+  # (Elixir's own source) would swap code out from under the run. This
+  # project's deps are fair game: the sweep never calls them.
+  def redefines_vm_module?(src) do
+    src
+    |> Code.string_to_quoted!()
+    |> defined_modules()
+    |> Enum.any?(&vm_module?/1)
+  end
+
+  # Names as written, without nesting - enough to spot the VM's own modules.
+  defp defined_modules(ast) do
+    {_ast, modules} =
+      Macro.prewalk(ast, [], fn
+        {kind, _, [{:__aliases__, _, parts} | _]} = node, acc when kind in [:defmodule, :defprotocol] ->
+          {node, [Module.concat(parts) | acc]}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    modules
+  end
+
+  defp vm_module?(module) do
+    case :code.where_is_file(~c"#{module}.beam") do
+      :non_existing ->
+        false
+
+      beam ->
+        beam = List.to_string(beam)
+        deps = Path.join(Mix.Project.build_path(), "lib")
+        not String.starts_with?(beam, deps) or String.starts_with?(beam, Mix.Project.app_path())
+    end
+  end
+
   def sorted_nonblank(s),
     do:
       s
@@ -160,6 +198,7 @@ sweep = fn root ->
               # No reorder - output is the base formatter's alone; nothing of
               # DefLayout's to compile-check.
               not reordered? -> {0, 0, problems}
+              Check.redefines_vm_module?(src) -> {0, 1, problems}
               not Check.compiles?(src) -> {0, 1, problems}
               Check.compiles?(out) -> {1, 0, problems}
               true -> {1, 0, [{:compile, f} | problems]}
