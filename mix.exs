@@ -31,9 +31,9 @@ defmodule DefLayout.MixProject do
   defp deps do
     [
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.35", only: :dev, runtime: false},
-      {:quokka, "~> 2.12", only: [:dev, :test], runtime: false},
-      {:stream_data, "~> 1.3", only: [:dev, :test], runtime: false}
+      {:ex_doc, "~> 0.40.4", only: :dev, runtime: false},
+      {:quokka, "~> 2.13", only: [:dev, :test], runtime: false},
+      {:stream_data, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 
