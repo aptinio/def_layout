@@ -633,6 +633,15 @@ defmodule DefLayout.Scan do
     |> collect_calls()
   end
 
+  defp head_call({:when, _, [call | _]}), do: call
+  defp head_call(head), do: head
+
+  defp argument_defaults({_name, _, args}) when is_list(args) do
+    for {:\\, _, [_pattern, default]} <- args, do: default
+  end
+
+  defp argument_defaults(_head), do: []
+
   defp collect_calls(ast) do
     {_node, calls} =
       ast
@@ -663,15 +672,6 @@ defmodule DefLayout.Scan do
   end
 
   defp unpipe(node), do: node
-
-  defp argument_defaults({_name, _, args}) when is_list(args) do
-    for {:\\, _, [_pattern, default]} <- args, do: default
-  end
-
-  defp argument_defaults(_head), do: []
-
-  defp head_call({:when, _, [call | _]}), do: call
-  defp head_call(head), do: head
 
   # A call inside a group's arity range resolves to that group's key. Among
   # overlapping ranges (a defaults conflict the compiler rejects anyway) the

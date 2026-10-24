@@ -43,6 +43,15 @@ defmodule Mix.Tasks.DefLayout.Skipped do
     |> report()
   end
 
+  defp files([]), do: inputs(File.cwd!())
+
+  defp files(paths) do
+    paths
+    |> Enum.flat_map(fn path -> Path.wildcard(path, match_dot: true) end)
+    |> Enum.uniq()
+    |> Enum.filter(&elixir_file?/1)
+  end
+
   defp report([]) do
     Mix.shell().info("No skipped modules.")
   end
@@ -51,15 +60,6 @@ defmodule Mix.Tasks.DefLayout.Skipped do
     for {path, line, label, reason} <- skips do
       Mix.shell().info("#{path}:#{line}: #{label} - #{reason}")
     end
-  end
-
-  defp files([]), do: inputs(File.cwd!())
-
-  defp files(paths) do
-    paths
-    |> Enum.flat_map(fn path -> Path.wildcard(path, match_dot: true) end)
-    |> Enum.uniq()
-    |> Enum.filter(&elixir_file?/1)
   end
 
   # Mirrors `mix format`'s no-argument file selection (`Mix.Tasks.Format`'s

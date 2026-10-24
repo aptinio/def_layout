@@ -55,19 +55,6 @@ defmodule DefLayout do
     |> Enum.join("\n")
   end
 
-  # Distinct modules' regions never overlap - a nested module's region lies
-  # strictly inside lines its outer never moves - and the bottom-up splice
-  # silently corrupts if that ever breaks, so assert it rather than assume it.
-  defp assert_disjoint(replacements) do
-    replacements
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.each(fn [{upper_start, _, _}, {_, lower_stop, _}] ->
-      true = lower_stop < upper_start
-    end)
-
-    replacements
-  end
-
   # Collects replacements from every module-shaped expr in a block - the file's
   # top level or a module body.
   defp replacements(block, source_lines) do
@@ -129,5 +116,18 @@ defmodule DefLayout do
     else
       _ -> []
     end
+  end
+
+  # Distinct modules' regions never overlap - a nested module's region lies
+  # strictly inside lines its outer never moves - and the bottom-up splice
+  # silently corrupts if that ever breaks, so assert it rather than assume it.
+  defp assert_disjoint(replacements) do
+    replacements
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.each(fn [{upper_start, _, _}, {_, lower_stop, _}] ->
+      true = lower_stop < upper_start
+    end)
+
+    replacements
   end
 end
